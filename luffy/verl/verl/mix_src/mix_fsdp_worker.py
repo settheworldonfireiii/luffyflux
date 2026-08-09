@@ -84,20 +84,31 @@ class MIXActorRolloutRefWorker(Worker):
             self._is_offload_param = self.config.ref.fsdp_config.get('param_offload', False)
 
         # normalize config
+        group_n = int(
+            self.config.rollout.get(
+                'group_n',
+                self.config.rollout.n,
+            )
+        )
+
+        if group_n <= 0:
+            raise ValueError(
+                f'rollout.group_n must be positive, got {group_n}'
+            ) 
         if self._is_actor:
-            self.config.actor.ppo_mini_batch_size *= self.config.rollout.n
-            self.config.actor.ppo_micro_batch_size *= self.config.rollout.n
+            self.config.actor.ppo_mini_batch_size *= group_n
+            self.config.actor.ppo_micro_batch_size *= group_n
             self.config.actor.ppo_mini_batch_size //= (self.device_mesh.shape[0] // self.ulysses_sequence_parallel_size)
             self.config.actor.ppo_micro_batch_size //= (self.device_mesh.shape[0] //
                                                         self.ulysses_sequence_parallel_size)
         if self._is_rollout:
             self.config.rollout.log_prob_micro_batch_size //= (self.device_mesh.shape[0] //
                                                                self.ulysses_sequence_parallel_size)
-            self.config.rollout.log_prob_micro_batch_size *= self.config.rollout.n
+            self.config.rollout.log_prob_micro_batch_size *= group_n
         if self._is_ref:
             self.config.ref.log_prob_micro_batch_size //= (self.device_mesh.shape[0] //
                                                            self.ulysses_sequence_parallel_size)
-            self.config.ref.log_prob_micro_batch_size *= self.config.rollout.n
+            self.config.ref.log_prob_micro_batch_size *= group_n
 
     def _build_model_optimizer(self,
                                model_path,
@@ -404,6 +415,7 @@ class MIXActorRolloutRefWorker(Worker):
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def generate_sequences(self, prompts: DataProto):
         prompts = prompts.to('cuda')
+        print("mix_fsdp_worker.py generate_sequences" , flush= True)
         # set to False if it is validation
         #recompute_log_prob = prompts.meta_info.get('recompute_log_prob', True)
 
@@ -439,6 +451,15 @@ class MIXActorRolloutRefWorker(Worker):
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_log_prob(self, data: DataProto):
         assert self._is_actor
+        import torch
+
+        if self._is_offload_param:
+            load_fsdp_param_and_grad(
+                module=self.actor_module_fsdp,
+                device_id=torch.cuda.current_device(),
+                load_grad=self._is_offload_grad,
+            )
+        
         data = data.to('cuda')
         # we should always recompute old_log_probs when it is HybridEngine
         data.meta_info['micro_batch_size'] = self.config.rollout.log_prob_micro_batch_size
@@ -459,35 +480,93 @@ class MIXActorRolloutRefWorker(Worker):
         # unshard the root FSDP module
         if self.world_size > 1:
             self.actor.actor_module._handle.reshard(True)
-
+        if self._is_offload_param:
+            offload_fsdp_param_and_grad(
+                module=self.actor_module_fsdp,
+                offload_grad=self._is_offload_grad,
+            )
         torch.cuda.empty_cache()
         return output
+        
+        
+        """
+        @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+        def compute_ref_log_prob(self, data: DataProto):
+            assert self._is_ref
 
-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
-    def compute_ref_log_prob(self, data: DataProto):
-        assert self._is_ref
+            data = data.to('cuda')
 
-        data = data.to('cuda')
+            micro_batch_size = self.config.ref.log_prob_micro_batch_size
+            data.meta_info['micro_batch_size'] = micro_batch_size
+            data.meta_info['temperature'] = self.config.rollout.temperature
+            data.meta_info['max_token_len'] = self.config.ref.log_prob_max_token_len_per_gpu
+            data.meta_info['use_dynamic_bsz'] = self.config.ref.log_prob_use_dynamic_bsz
+            with self.ulysses_sharding_manager:
+                data = self.ulysses_sharding_manager.preprocess_data(data)
+                output = self.ref_policy.compute_log_prob(data=data)
+                output = DataProto.from_dict(tensors={'ref_log_prob': output})
+                output = self.ulysses_sharding_manager.postprocess_data(output)
 
-        micro_batch_size = self.config.ref.log_prob_micro_batch_size
-        data.meta_info['micro_batch_size'] = micro_batch_size
-        data.meta_info['temperature'] = self.config.rollout.temperature
-        data.meta_info['max_token_len'] = self.config.ref.log_prob_max_token_len_per_gpu
-        data.meta_info['use_dynamic_bsz'] = self.config.ref.log_prob_use_dynamic_bsz
-        with self.ulysses_sharding_manager:
-            data = self.ulysses_sharding_manager.preprocess_data(data)
-            output = self.ref_policy.compute_log_prob(data=data)
-            output = DataProto.from_dict(tensors={'ref_log_prob': output})
-            output = self.ulysses_sharding_manager.postprocess_data(output)
+            output = output.to('cpu')
 
-        output = output.to('cpu')
+            # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
+            # unshard the root FSDP module
+            self.ref_policy.actor_module._handle.reshard(True)
 
-        # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
-        # unshard the root FSDP module
-        self.ref_policy.actor_module._handle.reshard(True)
+            torch.cuda.empty_cache()
+            return output
+        """
 
-        torch.cuda.empty_cache()
-        return output
+        @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+        def compute_log_prob(self, data: DataProto):
+            assert self._is_actor
+
+            # Parameters were offloaded after rollout generation.
+            # Bring the FSDP shards back before the actor forward pass.
+            if self._is_offload_param:
+                load_fsdp_param_and_grad(
+                    module=self.actor_module_fsdp,
+                    device_id=torch.cuda.current_device(),
+                    load_grad=self._is_offload_grad,
+                )
+
+            data = data.to("cuda")
+
+            # We should always recompute old_log_probs in HybridEngine.
+            data.meta_info["micro_batch_size"] = (
+                self.config.rollout.log_prob_micro_batch_size
+            )
+            data.meta_info["max_token_len"] = (
+                self.config.rollout.log_prob_max_token_len_per_gpu
+            )
+            data.meta_info["use_dynamic_bsz"] = (
+                self.config.rollout.log_prob_use_dynamic_bsz
+            )
+            data.meta_info["temperature"] = self.config.rollout.temperature
+
+            with self.ulysses_sharding_manager:
+                data = self.ulysses_sharding_manager.preprocess_data(data)
+                old_log_probs = self.actor.compute_log_prob(data=data)
+                data.batch["old_log_probs"] = old_log_probs
+                data = self.ulysses_sharding_manager.postprocess_data(data)
+
+            output = data.select(batch_keys=["old_log_probs"])
+            output = output.to("cpu")
+
+            # Reshard before moving the parameter shards back to CPU.
+            if self.world_size > 1:
+                self.actor.actor_module._handle.reshard(True)
+
+            if self._is_offload_param:
+                offload_fsdp_param_and_grad(
+                    module=self.actor_module_fsdp,
+                    offload_grad=self._is_offload_grad,
+                )
+
+            torch.cuda.empty_cache()
+            return output
+
+
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0):

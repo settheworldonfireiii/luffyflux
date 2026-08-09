@@ -40,6 +40,11 @@ from verl.third_party.vllm import LLM, vllm_version
 from verl.third_party.vllm import parallel_state as vllm_ps
 from vllm import SamplingParams
 
+
+
+from verl.mix_src.main_mix_ppo import RewardManager
+
+
 # TODO
 # 1. support pp in vllm
 # 2. passing tokenizer is not necessary? no encoding/decoding is happending here
@@ -121,6 +126,7 @@ class MIXvLLMRollout(vLLMRollout):
         Raises:
             RuntimeError: If generation fails after max_retries attempts.
         """
+        print("WIR SCHAUEN DIE SEQUENEZEN", flush = True)
         max_retries = int(max_retries)
         for attempt in range(max_retries):
             try:
@@ -255,6 +261,9 @@ class MIXvLLMRollout(vLLMRollout):
                         sampling_params=self.sampling_params,
                         prompt_token_ids=idx_list,
                         use_tqdm=False)
+                
+                #3 to match the official LUFFY recipee w o importing config into this file as it is a bunch of messy code
+                reward_fn = RewardManager(tokenizer=self.tokenizer, num_examine=0, reward_impl_version=3)
 
                 # Process outputs
                 response = output[0].to(idx.device)
@@ -424,4 +433,5 @@ def unit_test():
     print(prefix_list)
 
 if __name__ == "__main__":
+    print("ROLLOUT INNERLICH MIX SRC VERL", flush = True)
     unit_test()

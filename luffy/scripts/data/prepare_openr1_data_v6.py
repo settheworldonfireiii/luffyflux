@@ -13,8 +13,8 @@ import pandas as pd
 from verl.utils.hdfs_io import copy, makedirs
 from verl.utils.reward_score.math import last_boxed_only_string, remove_boxed
 
-from deepscaler.data.utils import load_dataset
-from deepscaler.data.dataset_types import TrainDataset, TestDataset
+#from deepscaler.data.utils import load_dataset
+#from deepscaler.data.dataset_types import TrainDataset, TestDataset
 
 
 def extract_solution(solution_str: str) -> str:
@@ -97,8 +97,18 @@ def make_openr1_map_fn(split: str):
             #     if correctness_math_verify[i] == True and is_reasoning_complete[i] == True:
             #         break
             # try:
-            generations = example.pop('generations')
+            #generations = example.pop('generations')
+            assert split == 'train'
+            generations = list(example.pop('generations'))
+
+            if len(generations) != 4:
+                raise ValueError(
+                    f"Expected exactly 4 teacher generations after filtering, "
+                    f"got {len(generations)} for index {idx}"
+                )
+
             target = generations[0]
+            target_lst = generations
             # except:
             #     breakpoint()
         else:
@@ -119,6 +129,7 @@ def make_openr1_map_fn(split: str):
                 "role": "assistant",
                 "content": target
             }],
+            'target_lst': target_lst,
             "ability": "math",
             "reward_model": {
                 "style": "rule",
@@ -185,11 +196,19 @@ if __name__ == '__main__':
     import datasets
     train_dataset = datasets.load_dataset('open-r1/OpenR1-Math-220k', split='train') # 94k    # filter the dataset
     # train_dataset = train_dataset.shuffle(seed=42).select(range(1000))
-    
-    tokenizer_path = "/mnt/petrelfs/yanjianhao/hf_models/Qwen2.5-1.5B-Instruct-ds-tok"
+    print('before 4-generation selection:', len(train_dataset))
+
+    train_dataset = train_dataset.filter(
+        lambda example: len(example['generations']) == 4
+    )
+
+    print('after 4-generation selection:', len(train_dataset))
+    assert len(train_dataset) == 3706, len(train_dataset)
+ 
+    tokenizer_path = "Elliott/Qwen2.5-Math-7B-16k-think"
     print('before filter:', len(train_dataset))
     train_dataset = train_dataset.map(filter_function, num_proc=20)
-    train_dataset = train_dataset.filter(lambda x: len(x['generations']) != 0)
+    train_dataset = train_dataset.filter(lambda x: len(x['generations']) == 4)
     print('after filter:', len(train_dataset))
     
     # filter target length > 8192
@@ -208,13 +227,13 @@ if __name__ == '__main__':
         return example
     
     train_dataset = train_dataset.map(filter_target_length, num_proc=20)
-    train_dataset = train_dataset.filter(lambda x: len(x['generations']) != 0)
+    train_dataset = train_dataset.filter(lambda x: len(x['generations']) == 4)
     print('after filter target length:', len(train_dataset))
-    
+    """ 
     test_datasets = [TestDataset.AIME, TestDataset.AMC, TestDataset.MATH, TestDataset.MINERVA, TestDataset.OLYMPIAD_BENCH]
     
     test_datasets_data = [load_dataset(d) for d in test_datasets]
-
+    """
     # Process training data
     train_data: List[Dict[str, Any]] = []
     process_fn = make_openr1_map_fn('train')
@@ -222,7 +241,7 @@ if __name__ == '__main__':
         processed_example = process_fn(example, idx)
         if processed_example is not None:
             train_data.append(processed_example)
-
+    """
     # Process and save each test dataset separately
     for test_dataset, test_data_list in zip(test_datasets, test_datasets_data):
         test_data: List[Dict[str, Any]] = []
@@ -236,7 +255,7 @@ if __name__ == '__main__':
         test_df = pd.DataFrame(test_data)
         test_df.to_parquet(os.path.join(local_dir, f'{dataset_name}.parquet'))
         print(f"{dataset_name} test data size:", len(test_data))
-
+    """
     # Save training dataset
     print("train data size:", len(train_data))
     train_df = pd.DataFrame(train_data)

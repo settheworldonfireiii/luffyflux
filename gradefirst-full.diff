@@ -1,0 +1,2746 @@
+diff --git a/luffy/scripts/data/prepare_openr1_data_v6.py b/luffy/scripts/data/prepare_openr1_data_v6.py
+index 45ae84f..15efd29 100644
+--- a/luffy/scripts/data/prepare_openr1_data_v6.py
++++ b/luffy/scripts/data/prepare_openr1_data_v6.py
+@@ -1,248 +1,267 @@
+ """Script to prepare DeepScaler training and test datasets.
+ 
+ This script processes math problem datasets into a standardized format for training
+ and testing DeepScaler models. It loads problems from specified datasets, adds
+ instruction prompts, and saves the processed data as parquet files.
+ """
+ 
+ import argparse
+ import os
+ from typing import Dict, List, Optional, Any
+ 
+ import pandas as pd
+ from verl.utils.hdfs_io import copy, makedirs
+ from verl.utils.reward_score.math import last_boxed_only_string, remove_boxed
+ 
+-from deepscaler.data.utils import load_dataset
+-from deepscaler.data.dataset_types import TrainDataset, TestDataset
++#from deepscaler.data.utils import load_dataset
++#from deepscaler.data.dataset_types import TrainDataset, TestDataset
+ 
+ 
+ def extract_solution(solution_str: str) -> str:
+     """Extract the final boxed solution from a solution string.
+ 
+     Args:
+         solution_str: Raw solution string that may contain multiple boxed answers
+ 
+     Returns:
+         The final boxed answer with box notation removed
+     """
+     return remove_boxed(last_boxed_only_string(solution_str))
+ 
+ 
+ def make_map_fn(split: str):
+     """Create a mapping function to process dataset examples.
+ 
+     Args:
+         split: Dataset split name ('train' or 'test')
+ 
+     Returns:
+         Function that processes individual dataset examples
+     """
+     def process_fn(example: Dict[str, Any], idx: int) -> Optional[Dict[str, Any]]:
+         question = example.pop('problem')
+         instruction = "Let's think step by step and output the final answer within \\boxed{}."
+         question = f"{question} {instruction}"
+         answer = example.pop('answer')
+ 
+         data = {
+             "data_source": "",
+             "prompt": [{
+                 "role": "user",
+                 "content": question
+             }],
+             "ability": "math",
+             "reward_model": {
+                 "style": "rule",
+                 "ground_truth": answer
+             },
+             "extra_info": {
+                 'split': split,
+                 'index': idx
+             }
+         }
+         return data
+     return process_fn
+ 
+ def make_openr1_map_fn(split: str):
+     """Create a mapping function to process dataset examples.
+ 
+     Args:
+         split: Dataset split name ('train' or 'test')
+ 
+     Returns:
+         Function that processes individual dataset examples
+     """
+     def process_fn(example: Dict[str, Any], idx: int) -> Optional[Dict[str, Any]]:
+         question = example.pop('problem')
+         # instruction = "Let's think step by step and output the final answer within \\boxed{}."
+         # instruction = "Think step by step within <think></think> tags, then generate the final answer within <begin_of_solution></begin_of_solution> tags.  Output the final answer in \\boxed{}."
+         # instruction = "Think step by step within <think></think> tags, then generate your answer.  Output the final answer in \\boxed{}."
+         instruction = """Your task is to follow a systematic, thorough reasoning process before providing the final solution. This involves analyzing, summarizing, exploring, reassessing, and refining your thought process through multiple iterations. Structure your response into two sections: Thought and Solution. In the Thought section, present your reasoning using the format: "<think>\n {thoughts} </think>\n". Each thought should include detailed analysis, brainstorming, verification, and refinement of ideas. After "</think>\n," in the Solution section, provide the final, logical, and accurate answer, clearly derived from the exploration in the Thought section. If applicable, include the answer in \\boxed{} for closed-form results like multiple choices or mathematical solutions."""
+         
+         # question = f"{question} {instruction}"
+         question = f"{question}"
+         answer = example.pop('answer')
+         # if split == 'train':
+         #     generations = example.pop('generations')
+         #     target = generations[0]
+         # else:
+         #     target = None
+         
+         if 'is_reasoning_complete' in example: # open-r1-data
+             assert split == 'train'
+             # is_reasoning_complete = example['is_reasoning_complete']
+             # correctness_math_verify = example['correctness_math_verify']
+             # assert len(correctness_math_verify) == len(is_reasoning_complete)
+             # for i in range(len(correctness_math_verify)):
+             #     if correctness_math_verify[i] == True and is_reasoning_complete[i] == True:
+             #         break
+             # try:
+-            generations = example.pop('generations')
++            #generations = example.pop('generations')
++            assert split == 'train'
++            generations = list(example.pop('generations'))
++
++            if len(generations) != 4:
++                raise ValueError(
++                    f"Expected exactly 4 teacher generations after filtering, "
++                    f"got {len(generations)} for index {idx}"
++                )
++
+             target = generations[0]
++            target_lst = generations
+             # except:
+             #     breakpoint()
+         else:
+             target = None
+ 
+         if split == 'train':
+             data = {
+                 "data_source": "",
+                 "prompt": [{
+                 "role": "system",
+                 "content": instruction
+             },
+                 {
+                 "role": "user",
+                 "content": question
+             }],
+             'target': [{
+                 "role": "assistant",
+                 "content": target
+             }],
++            'target_lst': target_lst,
+             "ability": "math",
+             "reward_model": {
+                 "style": "rule",
+                 "ground_truth": answer
+             },
+             "extra_info": {
+                 'split': 'default',
+                     'index': idx
+                 }
+             }
+         else:
+             assert target is None
+             data = {
+                 "data_source": "",
+                 "prompt": [{
+                 "role": "system",
+                 "content": instruction
+             },
+                 {
+                 "role": "user",
+                 "content": question
+             }],
+             "ability": "math",
+             "reward_model": {
+                 "style": "rule",
+                 "ground_truth": answer
+             },
+             "extra_info": {
+                 'split': 'default',
+                     'index': idx
+                 }
+             }
+         return data
+     return process_fn
+ 
+ def filter_function(example):
+     is_reasoning_complete = example['is_reasoning_complete']
+     correctness_math_verify = example['correctness_math_verify']
+     assert len(correctness_math_verify) == len(is_reasoning_complete)
+     filter = False
+     gens = []
+     for i in range(len(correctness_math_verify)):
+         if correctness_math_verify[i] == True and is_reasoning_complete[i] == True:
+             gens.append(example['generations'][i])
+     example['generations'] = gens
+     return example
+ 
+ 
+ if __name__ == '__main__':
+     parser = argparse.ArgumentParser(description='Process datasets for DeepScaler training')
+     parser.add_argument('--local_dir', default=os.path.expanduser('~/openr1/data'),
+                        help='Local directory to save processed datasets')
+     parser.add_argument('--hdfs_dir', default=None,
+                        help='Optional HDFS directory to copy datasets to')
+     args = parser.parse_args()
+ 
+     local_dir = args.local_dir
+     hdfs_dir = args.hdfs_dir
+     
+     # Make local directory if it doesn't exist
+     makedirs(local_dir)
+ 
+     # Initialize datasets
+     import datasets
+     train_dataset = datasets.load_dataset('open-r1/OpenR1-Math-220k', split='train') # 94k    # filter the dataset
+     # train_dataset = train_dataset.shuffle(seed=42).select(range(1000))
+-    
+-    tokenizer_path = "/mnt/petrelfs/yanjianhao/hf_models/Qwen2.5-1.5B-Instruct-ds-tok"
++    print('before 4-generation selection:', len(train_dataset))
++
++    train_dataset = train_dataset.filter(
++        lambda example: len(example['generations']) == 4
++    )
++
++    print('after 4-generation selection:', len(train_dataset))
++    assert len(train_dataset) == 3706, len(train_dataset)
++ 
++    tokenizer_path = "Elliott/Qwen2.5-Math-7B-16k-think"
+     print('before filter:', len(train_dataset))
+     train_dataset = train_dataset.map(filter_function, num_proc=20)
+-    train_dataset = train_dataset.filter(lambda x: len(x['generations']) != 0)
++    train_dataset = train_dataset.filter(lambda x: len(x['generations']) == 4)
+     print('after filter:', len(train_dataset))
+     
+     # filter target length > 8192
+     from transformers import AutoTokenizer
+     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+     
+     def filter_target_length(example):
+         gens = []
+         for i, generation in enumerate(example['generations']):
+             generation_input_ids = tokenizer(generation, add_special_tokens=False)['input_ids']
+             if len(generation_input_ids) > 8192:
+                 pass
+             else:
+                 gens.append(generation)
+         example['generations'] = gens
+         return example
+     
+     train_dataset = train_dataset.map(filter_target_length, num_proc=20)
+-    train_dataset = train_dataset.filter(lambda x: len(x['generations']) != 0)
++    train_dataset = train_dataset.filter(lambda x: len(x['generations']) == 4)
+     print('after filter target length:', len(train_dataset))
+-    
++    """ 
+     test_datasets = [TestDataset.AIME, TestDataset.AMC, TestDataset.MATH, TestDataset.MINERVA, TestDataset.OLYMPIAD_BENCH]
+     
+     test_datasets_data = [load_dataset(d) for d in test_datasets]
+-
++    """
+     # Process training data
+     train_data: List[Dict[str, Any]] = []
+     process_fn = make_openr1_map_fn('train')
+     for idx, example in enumerate(train_dataset):
+         processed_example = process_fn(example, idx)
+         if processed_example is not None:
+             train_data.append(processed_example)
+-
++    """
+     # Process and save each test dataset separately
+     for test_dataset, test_data_list in zip(test_datasets, test_datasets_data):
+         test_data: List[Dict[str, Any]] = []
+         test_process_fn = make_openr1_map_fn('test')
+         for idx, example in enumerate(test_data_list):
+             processed_example = test_process_fn(example, idx)
+             if processed_example is not None:
+                 test_data.append(processed_example)
+ 
+         dataset_name = test_dataset.value.lower()
+         test_df = pd.DataFrame(test_data)
+         test_df.to_parquet(os.path.join(local_dir, f'{dataset_name}.parquet'))
+         print(f"{dataset_name} test data size:", len(test_data))
+-
++    """
+     # Save training dataset
+     print("train data size:", len(train_data))
+     train_df = pd.DataFrame(train_data)
+     train_df.to_parquet(os.path.join(local_dir, 'train.parquet'))
+ 
+     # Optionally copy to HDFS
+     if hdfs_dir is not None:
+         makedirs(hdfs_dir)
+-        copy(src=local_dir, dst=hdfs_dir)
+\ No newline at end of file
++        copy(src=local_dir, dst=hdfs_dir)
+diff --git a/luffy/verl/verl/mix_src/config/mix_ppo_trainer.yaml b/luffy/verl/verl/mix_src/config/mix_ppo_trainer.yaml
+index ffb446b..cc65275 100644
+--- a/luffy/verl/verl/mix_src/config/mix_ppo_trainer.yaml
++++ b/luffy/verl/verl/mix_src/config/mix_ppo_trainer.yaml
+@@ -1,210 +1,212 @@
+ data:
+   tokenizer: null
+   train_files: ~/data/rlhf/gsm8k/train.parquet
+   val_files: ~/data/rlhf/gsm8k/test.parquet
+   prompt_key: prompt
+-  max_prompt_length: 512
+-  max_response_length: 512
++  max_prompt_length: 1024
++  max_response_length: 8192
+   train_batch_size: 1024
+   val_batch_size: 1312
+   return_raw_input_ids: False  # This should be set to true when the tokenizer between policy and rm differs
+   return_raw_chat: False
+   reward_impl_version: 0
+   filter_targets: False
+   shuffle: True
+   sample_target_ratio: 1.0
+   filter_accuracy: False
+   accuracy_lower_bound: 0.0
+   accuracy_upper_bound: 1.0
+   add_tgt_with_acc: False
+   add_tgt_acc_upper_bound: 0.5
+   disable_truncation_advantage: False
+-
++  teacher_pool_key: target_lst
++  teacher_pool_size: 4
+ 
+ actor_rollout_ref:
+   hybrid_engine: True
+   model:
+     path: ~/models/deepseek-llm-7b-chat
+     external_lib: null
+     override_config: { }
+     enable_gradient_checkpointing: True
+     use_remove_padding: False
+   actor:
+     strategy: fsdp  # This is for backward-compatibility
+     ppo_mini_batch_size: 256
+     ppo_micro_batch_size: 64
+     use_dynamic_bsz: False
+     ppo_max_token_len_per_gpu: 16384 # n * ${data.max_prompt_length} + ${data.max_response_length}
+     grad_clip: 1.0
+     clip_ratio: 0.2
+     clip_upper_bound: 1.0
+     entropy_coeff: 0.001
+     use_kl_loss: True # True for GRPO, False for REINFORCE++
+     kl_loss_coef: 0.001 # for grpo
+     kl_loss_type: low_var_kl # for grpo
+     ppo_epochs: 1
+     shuffle: False
+     ulysses_sequence_parallel_size: 1 # sp size
+     optim:
+       lr: 1e-6
+       lr_warmup_steps_ratio: 0.  # the total steps will be injected during runtime
+       min_lr_ratio: null   # only useful for warmup with cosine
+       warmup_style: constant  # select from constant/cosine
+       total_training_steps: -1  # must be override by program
+     fsdp_config:
+       wrap_policy:
+         # transformer_layer_cls_to_wrap: None
+         min_num_params: 0
+       param_offload: False
+       grad_offload: False
+       optimizer_offload: False
+       fsdp_size: -1
+     use_sft_prefix_reward: False
+     use_sft_reward: False
+     use_off_policy_loss: False
+     off_policy_loss_impl: token
+     off_policy_cliprange: 0.2
+     off_policy_normalize: False
+     use_off_policy_probs: False
+     use_off_policy_clip: False
+     off_policy_max_clip: -1
+     off_policy_min_clip: -1
+     off_policy_reshape: "no_reshape"
+     off_policy_reshape_weight: 0.1
+     off_policy_reshape_pow_exp: 0.5
+     on_policy_reshape: "no_reshape"
+     on_policy_reshape_weight: 0.1
+     on_policy_reshape_pow_exp: 0.5
+     sft_prefix_reward_weight: 1.0
+     all_max_clip: -1
+     use_ppo_kl_loss: False
+     ppo_kl_loss_coef: 0.01
+     use_adaptive_temperature: False
+     use_adaptive_temperature_fixed: False
+     adaptive_temperature_clip: -1
+     adaptive_temperature_target_entropy: 1.0
+     alpha_lr: 1e-2
+     debug: False
+     use_target_lst: False
+     loss_remove_token_mean: False
+     loss_remove_clip: False
+     sft_loss_coef: 1.0
+     use_sft_multitask_loss: False
+ 
+   ref:
+     fsdp_config:
+       param_offload: False
+       wrap_policy:
+         # transformer_layer_cls_to_wrap: None
+         min_num_params: 0
+     log_prob_micro_batch_size: 128
+     log_prob_use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
+     log_prob_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
+     ulysses_sequence_parallel_size: ${actor_rollout_ref.actor.ulysses_sequence_parallel_size} # sp size
+     use_ref: True
+   rollout:
+     name: vllm
+     temperature: 1.0
+     val_temperature: 0.6
+     top_k: -1 # 0 for hf rollout, -1 for vllm rollout
+     top_p: 1
+     prompt_length: ${data.max_prompt_length}  # not use for opensource
+     response_length: ${data.max_response_length}
+     # for vllm rollout
+     dtype: bfloat16 # should align with FSDP
+     gpu_memory_utilization: 0.5
+     ignore_eos: False
+     enforce_eager: True
+     free_cache_engine: True
+     load_format: dummy_dtensor
+     tensor_model_parallel_size: 2
+     max_num_batched_tokens: 8192
+     max_num_seqs: 1024
+     log_prob_micro_batch_size: 128
+     log_prob_use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
+     log_prob_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
+     enable_chunked_prefill: True
+     # for hf rollout
+     do_sample: True
+     # number of responses (i.e. num sample times)
+     n: 1 # > 1 for grpo
++    group_n: ${actor_rollout_ref.rollout.n}
+     n_val: 8
+     # define prefix hyperparameters
+     prefix_strategy: random
+     prefix_steps: 1000
+     prefix_linear_max_ratio: 0.8
+     prefix_linear_max_var: 0.1
+     max_prefix_len: 8192
+     min_prefix_ratio: 0.0
+     max_prefix_ratio: 1.0
+     prefix_reward_strategy: all
+     prefix_reward_weight_alpha: 1.0
+     prefix_reward_weight_beta: 1.0
+     prefix_share_across_samples: False
+     n_prefix: -1
+ 
+ critic:
+   strategy: fsdp
+   optim:
+     lr: 1e-5
+     lr_warmup_steps_ratio: 0.  # the total steps will be injected during runtime
+     min_lr_ratio: null   # only useful for warmup with cosine
+     warmup_style: constant  # select from constant/cosine
+     total_training_steps: -1  # must be override by program
+   model:
+     path: ~/models/deepseek-llm-7b-chat
+     tokenizer_path: ${actor_rollout_ref.model.path}
+     override_config: { }
+     external_lib: ${actor_rollout_ref.model.external_lib}
+     enable_gradient_checkpointing: True
+     use_remove_padding: False
+     fsdp_config:
+       param_offload: False
+       grad_offload: False
+       optimizer_offload: False
+       wrap_policy:
+         # transformer_layer_cls_to_wrap: None
+         min_num_params: 0
+       fsdp_size: -1
+   ppo_mini_batch_size: ${actor_rollout_ref.actor.ppo_mini_batch_size}
+   ppo_micro_batch_size: 64
+   forward_micro_batch_size: ${critic.ppo_micro_batch_size}
+   use_dynamic_bsz: ${actor_rollout_ref.actor.use_dynamic_bsz}
+   ppo_max_token_len_per_gpu: 32768 # (${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}) * 2
+   forward_max_token_len_per_gpu: ${critic.ppo_max_token_len_per_gpu}
+   ulysses_sequence_parallel_size: 1 # sp size
+   ppo_epochs: ${actor_rollout_ref.actor.ppo_epochs}
+   shuffle: ${actor_rollout_ref.actor.shuffle}
+   grad_clip: 1.0
+   cliprange_value: 0.5
+ 
+ reward_model:
+   enable: False
+   strategy: fsdp
+   model:
+     input_tokenizer: ${actor_rollout_ref.model.path}  # set this to null if the chat template is identical
+     path: ~/models/FsfairX-LLaMA3-RM-v0.1
+     external_lib: ${actor_rollout_ref.model.external_lib}
+     use_remove_padding: False
+     fsdp_config:
+       min_num_params: 0
+       param_offload: False
+       fsdp_size: -1
+   micro_batch_size: 64
+   max_length: null
+   ulysses_sequence_parallel_size: 1 # sp size
+   use_dynamic_bsz: ${critic.use_dynamic_bsz}
+   forward_max_token_len_per_gpu: ${critic.forward_max_token_len_per_gpu}
+ 
+ algorithm:
+   gamma: 1.0
+   lam: 1.0
+   adv_estimator: gae
+   kl_penalty: kl  # how to estimate kl divergence
+   kl_ctrl:
+     type: fixed
+     kl_coef: 0.001
+   grpo_use_std: True
+   surprisal_base: 0.0
+ 
+ trainer:
+diff --git a/luffy/verl/verl/mix_src/mix_fsdp_worker.py b/luffy/verl/verl/mix_src/mix_fsdp_worker.py
+index 29949f8..df8c44e 100644
+--- a/luffy/verl/verl/mix_src/mix_fsdp_worker.py
++++ b/luffy/verl/verl/mix_src/mix_fsdp_worker.py
+@@ -7,174 +7,185 @@ import torch.distributed
+ from torch.distributed.device_mesh import init_device_mesh
+ import verl.utils.hdfs_io as hdfs_io
+ import verl.utils.torch_functional as verl_F
+ from omegaconf import DictConfig, open_dict
+ from verl import DataProto
+ from verl.single_controller.base import Worker
+ from verl.single_controller.base.decorator import register, Dispatch
+ from verl.utils import hf_tokenizer
+ from verl.utils.debug import log_gpu_memory_usage
+ from verl.utils.fs import copy_local_path_from_hdfs
+ from verl.utils.fsdp_utils import get_fsdp_wrap_policy, offload_fsdp_grad, init_fn, get_init_weight_context_manager
+ from verl.utils.fsdp_utils import offload_fsdp_optimizer, offload_fsdp_param_and_grad, load_fsdp_optimizer, \
+     load_fsdp_param_and_grad
+ from verl.utils.import_utils import import_external_libs
+ from verl.utils.model import compute_position_id_with_mask
+ from verl.utils.flops_counter import FlopsCounter
+ from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
+ from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
+ 
+ 
+ from verl.workers.fsdp_workers import (
+     create_device_mesh, 
+     init_device_mesh,
+     get_fsdp_wrap_policy,
+     get_sharding_strategy,
+     get_init_weight_context_manager,
+     offload_fsdp_grad,
+     offload_fsdp_optimizer,
+     offload_fsdp_param_and_grad,
+     load_fsdp_optimizer,
+     load_fsdp_param_and_grad
+ )
+ from codetiming import Timer
+ 
+ logger = logging.getLogger(__file__)
+ logger.setLevel(os.getenv('VERL_PPO_LOGGING_LEVEL', 'WARN'))
+ 
+ class MIXActorRolloutRefWorker(Worker):
+     def __init__(self, config: DictConfig, role: str):
+         super().__init__()
+         self.config = config
+         import torch.distributed
+         if not torch.distributed.is_initialized():
+             torch.distributed.init_process_group(backend="nccl")
+ 
+         # build device mesh for FSDP
+         world_size = torch.distributed.get_world_size()
+         # TODO(sgm): support FSDP hybrid shard for larger model
+         self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=self.config.actor.fsdp_config.fsdp_size)
+ 
+         # build device mesh for Ulysses Sequence Parallel
+         self.ulysses_device_mesh = None
+         self.ulysses_sequence_parallel_size = self.config.actor.get('ulysses_sequence_parallel_size', 1)
+         dp = world_size // self.ulysses_sequence_parallel_size
+         if self.ulysses_sequence_parallel_size > 1:
+             self.ulysses_device_mesh = init_device_mesh('cuda',
+                                                         mesh_shape=(dp, self.ulysses_sequence_parallel_size),
+                                                         mesh_dim_names=['dp', 'sp'])
+ 
+         self.ulysses_sharding_manager = FSDPUlyssesShardingManager(self.ulysses_device_mesh)
+ 
+         self.role = role
+         assert self.role in ['actor', 'rollout', 'ref', 'actor_rollout', 'actor_rollout_ref']
+ 
+         self._is_actor = self.role in ['actor', 'actor_rollout', 'actor_rollout_ref']
+         self._is_rollout = self.role in ['rollout', 'actor_rollout', 'actor_rollout_ref']
+         self._is_ref = self.role in ['ref', 'actor_rollout_ref']
+ 
+         self._is_offload_param = False
+         self._is_offload_grad = False
+         self._is_offload_optimizer = False
+         if self._is_actor:
+             self._is_offload_param = self.config.actor.fsdp_config.get('param_offload', False)
+             self._is_offload_grad = self.config.actor.fsdp_config.get('grad_offload', False)
+             self._is_offload_optimizer = self.config.actor.fsdp_config.get('optimizer_offload', False)
+         elif self._is_ref:
+             # TODO: it seems that manual offload is slowly than FSDP offload
+             self._is_offload_param = self.config.ref.fsdp_config.get('param_offload', False)
+ 
+         # normalize config
++        group_n = int(
++            self.config.rollout.get(
++                'group_n',
++                self.config.rollout.n,
++            )
++        )
++
++        if group_n <= 0:
++            raise ValueError(
++                f'rollout.group_n must be positive, got {group_n}'
++            ) 
+         if self._is_actor:
+-            self.config.actor.ppo_mini_batch_size *= self.config.rollout.n
+-            self.config.actor.ppo_micro_batch_size *= self.config.rollout.n
++            self.config.actor.ppo_mini_batch_size *= group_n
++            self.config.actor.ppo_micro_batch_size *= group_n
+             self.config.actor.ppo_mini_batch_size //= (self.device_mesh.shape[0] // self.ulysses_sequence_parallel_size)
+             self.config.actor.ppo_micro_batch_size //= (self.device_mesh.shape[0] //
+                                                         self.ulysses_sequence_parallel_size)
+         if self._is_rollout:
+             self.config.rollout.log_prob_micro_batch_size //= (self.device_mesh.shape[0] //
+                                                                self.ulysses_sequence_parallel_size)
+-            self.config.rollout.log_prob_micro_batch_size *= self.config.rollout.n
++            self.config.rollout.log_prob_micro_batch_size *= group_n
+         if self._is_ref:
+             self.config.ref.log_prob_micro_batch_size //= (self.device_mesh.shape[0] //
+                                                            self.ulysses_sequence_parallel_size)
+-            self.config.ref.log_prob_micro_batch_size *= self.config.rollout.n
++            self.config.ref.log_prob_micro_batch_size *= group_n
+ 
+     def _build_model_optimizer(self,
+                                model_path,
+                                fsdp_config,
+                                optim_config,
+                                override_model_config,
+                                use_remove_padding=False,
+                                enable_gradient_checkpointing=False,
+                                trust_remote_code=False,
+                                role='actor'):
+         from verl.utils.model import print_model_size, update_model_config
+         from verl.utils.torch_dtypes import PrecisionType
+         from transformers import AutoModelForCausalLM, AutoConfig
+         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, ShardingStrategy, MixedPrecision, CPUOffload
+         from torch import optim
+ 
+         assert role in ['actor', 'ref']
+ 
+         log_gpu_memory_usage('Before init from HF AutoModel', logger=logger)
+         local_path = copy_local_path_from_hdfs(model_path)
+ 
+         # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
+         # TODO(zhangchi.usc1992): 1. support create from random initialized model. 2. Support init with FSDP directly
+         self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+ 
+         torch_dtype = fsdp_config.get('model_dtype', None)
+         if torch_dtype is None:
+             torch_dtype = torch.float32 if self._is_actor else torch.bfloat16
+         else:
+             torch_dtype = PrecisionType.to_dtype(torch_dtype)
+ 
+         # override model kwargs
+         actor_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code)
+ 
+         if use_remove_padding:
+             from verl.models.registry import check_model_support_rmpad
+             check_model_support_rmpad(actor_model_config.model_type)
+ 
+         if use_remove_padding and self.ulysses_sequence_parallel_size > 1:
+             from verl.models.transformers.monkey_patch import apply_monkey_patch
+             apply_monkey_patch(actor_model_config, verbose=True)
+ 
+         override_config_kwargs = {
+             'bos_token_id': self.tokenizer.bos_token_id,
+             'eos_token_id': self.tokenizer.eos_token_id,
+             'pad_token_id': self.tokenizer.pad_token_id,
+         }
+         override_config_kwargs.update(override_model_config)
+         update_model_config(actor_model_config, override_config_kwargs=override_config_kwargs)
+         if self.rank == 0:
+             print(f'Model config after override: {actor_model_config}')
+ 
+         # NOTE(fix me): tie_word_embedding causes meta_tensor init to hang
+         init_context = get_init_weight_context_manager(use_meta_tensor=not actor_model_config.tie_word_embeddings)
+ 
+         with init_context(), warnings.catch_warnings():
+             warnings.simplefilter("ignore")
+             actor_module = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path=local_path,
+                                                                 torch_dtype=torch_dtype,
+                                                                 config=actor_model_config,
+                                                                 attn_implementation='flash_attention_2',
+                                                                 trust_remote_code=trust_remote_code)
+             # some parameters may not in torch_dtype. TODO(zhangchi.usc1992) remove this after we switch to fsdp2
+             actor_module.to(torch_dtype)
+             # if self._is_actor and self.config.actor.use_adaptive_temperature is True:
+             #     print(f"Register log_alpha as a parameter!")
+             #     # register log_alpha as a parameter
+             #     import numpy as np
+             #     log_alpha = torch.tensor(np.log(self.config.actor.entropy_coeff), dtype=torch.float).to(actor_module.device).reshape(1, 1)
+             #     log_alpha.requires_grad = True
+             #     log_alpha = torch.nn.Parameter(log_alpha)
+             #     actor_module.register_parameter('log_alpha', log_alpha)
+ 
+             if enable_gradient_checkpointing:
+                 actor_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={'use_reentrant': False})
+         torch.distributed.barrier()
+ 
+         if self.rank == 0:
+             print_model_size(actor_module)
+ 
+@@ -327,218 +338,286 @@ class MIXActorRolloutRefWorker(Worker):
+                 self.config.actor.use_remove_padding = use_remove_padding
+             from .mix_actor import MIXDataParallelPPOActor
+             self.actor = MIXDataParallelPPOActor(config=self.config.actor,
+                                               actor_module=self.actor_module_fsdp,
+                                               actor_optimizer=self.actor_optimizer)
+ 
+         if self._is_rollout:
+             self.rollout, self.rollout_sharding_manager = self._build_rollout()
+ 
+         if self._is_ref:
+             self.ref_module_fsdp = self._build_model_optimizer(model_path=self.config.model.path,
+                                                                fsdp_config=self.config.ref.fsdp_config,
+                                                                optim_config=None,
+                                                                override_model_config=override_model_config,
+                                                                use_remove_padding=use_remove_padding,
+                                                                trust_remote_code=self.config.model.get(
+                                                                    'trust_remote_code', False),
+                                                                role='ref')[0]
+             OmegaConf.set_struct(self.config.ref, True)
+             with open_dict(self.config.ref):
+                 self.config.ref.use_remove_padding = use_remove_padding
+             self.ref_policy = DataParallelPPOActor(config=self.config.ref, actor_module=self.ref_module_fsdp)
+ 
+         if self._is_actor:
+             self.flops_counter = FlopsCounter(self.actor_model_config)
+             self.checkpoint_manager = FSDPCheckpointManager(model=self.actor_module_fsdp,
+                                                             optimizer=self.actor.actor_optimizer,
+                                                             lr_scheduler=self.actor_lr_scheduler,
+                                                             tokenizer=self.tokenizer)
+             
+         torch.cuda.empty_cache()
+         
+     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+     def update_actor(self, data: DataProto):
+         data = data.to('cuda')
+ 
+         assert self._is_actor
+         if self._is_offload_param:
+             load_fsdp_param_and_grad(module=self.actor_module_fsdp,
+                                      device_id=torch.cuda.current_device(),
+                                      load_grad=self._is_offload_grad)
+         if self._is_offload_optimizer:
+             load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=torch.cuda.current_device())
+ 
+         data.batch = data.batch.cuda()
+ 
+         log_gpu_memory_usage('Before update policy', logger=logger)
+ 
+         with self.ulysses_sharding_manager:
+             data = self.ulysses_sharding_manager.preprocess_data(data=data)
+             # perform training
+             with Timer(name='update_policy', logger=None) as timer:
+                 metrics = self.actor.update_policy(data=data)
+             delta_time = timer.last
+             global_num_tokens = data.meta_info['global_token_num']
+             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+             metrics['mfu/actor'] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
+ 
+             self.actor_lr_scheduler.step()
+             lr = self.actor_lr_scheduler.get_last_lr()[0]
+             metrics['actor/lr'] = lr
+ 
+             log_gpu_memory_usage('After update policy', logger=logger)
+ 
+             # TODO: here, we should return all metrics
+             output = DataProto(meta_info={'metrics': metrics})
+ 
+             output = self.ulysses_sharding_manager.postprocess_data(data=output)
+             output = output.to('cpu')
+ 
+         if self._is_offload_param:
+             offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
+         if self._is_offload_optimizer:
+             offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+         torch.cuda.empty_cache()
+         return output
+ 
+     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+     def generate_sequences(self, prompts: DataProto):
+         prompts = prompts.to('cuda')
++        print("mix_fsdp_worker.py generate_sequences" , flush= True)
+         # set to False if it is validation
+         #recompute_log_prob = prompts.meta_info.get('recompute_log_prob', True)
+ 
+         assert self._is_rollout
+         if self._is_offload_param:
+             load_fsdp_param_and_grad(module=self.actor_module_fsdp,
+                                      device_id=torch.cuda.current_device(),
+                                      load_grad=self._is_offload_grad)
+ 
+         prompts.batch = prompts.batch.cuda()
+         meta_info = {'eos_token_id': self.tokenizer.eos_token_id, 'pad_token_id': self.tokenizer.pad_token_id}
+         prompts.meta_info.update(meta_info)
+         with self.rollout_sharding_manager:
+             log_gpu_memory_usage('After entering rollout sharding manager', logger=logger)
+ 
+             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
+             output = self.rollout.generate_sequences(prompts=prompts)
+ 
+             log_gpu_memory_usage('After rollout generation', logger=logger)
+ 
+             output = self.rollout_sharding_manager.postprocess_data(output)
+ 
+         output = output.to('cpu')
+ 
+         if self._is_offload_param:
+             # NOTE(sgm): the grad is already in CPU, only offload param here
+             offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
+         # clear kv cache
+         torch.cuda.empty_cache()
+         log_gpu_memory_usage('After recompute log prob', logger=logger)
+         return output
+ 
+     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+     def compute_log_prob(self, data: DataProto):
+         assert self._is_actor
++        import torch
++
++        if self._is_offload_param:
++            load_fsdp_param_and_grad(
++                module=self.actor_module_fsdp,
++                device_id=torch.cuda.current_device(),
++                load_grad=self._is_offload_grad,
++            )
++        
+         data = data.to('cuda')
+         # we should always recompute old_log_probs when it is HybridEngine
+         data.meta_info['micro_batch_size'] = self.config.rollout.log_prob_micro_batch_size
+         data.meta_info['max_token_len'] = self.config.rollout.log_prob_max_token_len_per_gpu
+         data.meta_info['use_dynamic_bsz'] = self.config.rollout.log_prob_use_dynamic_bsz
+         data.meta_info['temperature'] = self.config.rollout.temperature
+         # perform recompute log_prob
+         with self.ulysses_sharding_manager:
+             data = self.ulysses_sharding_manager.preprocess_data(data)
+             old_log_probs = self.actor.compute_log_prob(data=data)
+             data.batch['old_log_probs'] = old_log_probs
+             data = self.ulysses_sharding_manager.postprocess_data(data)
+ 
+         output = data.select(batch_keys=['old_log_probs'])
+         output = output.to('cpu')
+ 
+         # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
+         # unshard the root FSDP module
+         if self.world_size > 1:
+             self.actor.actor_module._handle.reshard(True)
+-
++        if self._is_offload_param:
++            offload_fsdp_param_and_grad(
++                module=self.actor_module_fsdp,
++                offload_grad=self._is_offload_grad,
++            )
+         torch.cuda.empty_cache()
+         return output
++        
++        
++        """
++        @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
++        def compute_ref_log_prob(self, data: DataProto):
++            assert self._is_ref
++
++            data = data.to('cuda')
++
++            micro_batch_size = self.config.ref.log_prob_micro_batch_size
++            data.meta_info['micro_batch_size'] = micro_batch_size
++            data.meta_info['temperature'] = self.config.rollout.temperature
++            data.meta_info['max_token_len'] = self.config.ref.log_prob_max_token_len_per_gpu
++            data.meta_info['use_dynamic_bsz'] = self.config.ref.log_prob_use_dynamic_bsz
++            with self.ulysses_sharding_manager:
++                data = self.ulysses_sharding_manager.preprocess_data(data)
++                output = self.ref_policy.compute_log_prob(data=data)
++                output = DataProto.from_dict(tensors={'ref_log_prob': output})
++                output = self.ulysses_sharding_manager.postprocess_data(output)
+ 
+-    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+-    def compute_ref_log_prob(self, data: DataProto):
+-        assert self._is_ref
++            output = output.to('cpu')
+ 
+-        data = data.to('cuda')
++            # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
++            # unshard the root FSDP module
++            self.ref_policy.actor_module._handle.reshard(True)
+ 
+-        micro_batch_size = self.config.ref.log_prob_micro_batch_size
+-        data.meta_info['micro_batch_size'] = micro_batch_size
+-        data.meta_info['temperature'] = self.config.rollout.temperature
+-        data.meta_info['max_token_len'] = self.config.ref.log_prob_max_token_len_per_gpu
+-        data.meta_info['use_dynamic_bsz'] = self.config.ref.log_prob_use_dynamic_bsz
+-        with self.ulysses_sharding_manager:
+-            data = self.ulysses_sharding_manager.preprocess_data(data)
+-            output = self.ref_policy.compute_log_prob(data=data)
+-            output = DataProto.from_dict(tensors={'ref_log_prob': output})
+-            output = self.ulysses_sharding_manager.postprocess_data(output)
++            torch.cuda.empty_cache()
++            return output
++        """
+ 
+-        output = output.to('cpu')
++        @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
++        def compute_log_prob(self, data: DataProto):
++            assert self._is_actor
++
++            # Parameters were offloaded after rollout generation.
++            # Bring the FSDP shards back before the actor forward pass.
++            if self._is_offload_param:
++                load_fsdp_param_and_grad(
++                    module=self.actor_module_fsdp,
++                    device_id=torch.cuda.current_device(),
++                    load_grad=self._is_offload_grad,
++                )
++
++            data = data.to("cuda")
++
++            # We should always recompute old_log_probs in HybridEngine.
++            data.meta_info["micro_batch_size"] = (
++                self.config.rollout.log_prob_micro_batch_size
++            )
++            data.meta_info["max_token_len"] = (
++                self.config.rollout.log_prob_max_token_len_per_gpu
++            )
++            data.meta_info["use_dynamic_bsz"] = (
++                self.config.rollout.log_prob_use_dynamic_bsz
++            )
++            data.meta_info["temperature"] = self.config.rollout.temperature
++
++            with self.ulysses_sharding_manager:
++                data = self.ulysses_sharding_manager.preprocess_data(data)
++                old_log_probs = self.actor.compute_log_prob(data=data)
++                data.batch["old_log_probs"] = old_log_probs
++                data = self.ulysses_sharding_manager.postprocess_data(data)
++
++            output = data.select(batch_keys=["old_log_probs"])
++            output = output.to("cpu")
++
++            # Reshard before moving the parameter shards back to CPU.
++            if self.world_size > 1:
++                self.actor.actor_module._handle.reshard(True)
++
++            if self._is_offload_param:
++                offload_fsdp_param_and_grad(
++                    module=self.actor_module_fsdp,
++                    offload_grad=self._is_offload_grad,
++                )
++
++            torch.cuda.empty_cache()
++            return output
+ 
+-        # https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes
+-        # unshard the root FSDP module
+-        self.ref_policy.actor_module._handle.reshard(True)
+ 
+-        torch.cuda.empty_cache()
+-        return output
+ 
+     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0):
+         # only support save and load ckpt for actor
+         assert self._is_actor
+         import torch
+         if self._is_offload_param:
+             load_fsdp_param_and_grad(module=self.actor_module_fsdp,
+                                      device_id=torch.cuda.current_device(),
+                                      load_grad=self._is_offload_grad)
+ 
+         self.checkpoint_manager.save_checkpoint(local_path=local_path, hdfs_path=hdfs_path, global_step=global_step)
+ 
+         torch.distributed.barrier()
+         if self._is_offload_param:
+             offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
+     
+     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+     def save_checkpoint_hf(self, local_path):
+         assert self._is_actor
+         import torch
+         if self._is_offload_param:
+             load_fsdp_param_and_grad(module=self.actor_module_fsdp,
+                                      device_id=torch.cuda.current_device(),
+                                      load_grad=self._is_offload_grad)
+ 
+         # TODO: support DCP and save sharded checkpoints
+         import torch.distributed
+         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, StateDictType, FullStateDictConfig
+         cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+         with FSDP.state_dict_type(self.actor.actor_module, StateDictType.FULL_STATE_DICT, cfg):
+             state_dict = self.actor.actor_module.state_dict()
+         if self.rank == 0:
+             print(f'Saving actor checkpoint to {local_path}')
+             os.makedirs(local_path, exist_ok=True)
+             self.actor_module.save_pretrained(local_path, state_dict=state_dict)
+             self.tokenizer.save_pretrained(local_path)
+ 
+         torch.distributed.barrier()
+         if self._is_offload_param:
+             offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
+ 
+ 
+     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+     def load_checkpoint(self, path, del_local_after_load=True):
+         if self._is_offload_param:
+             load_fsdp_param_and_grad(module=self.actor_module_fsdp,
+                                      device_id=torch.cuda.current_device(),
+                                      load_grad=self._is_offload_grad)
+ 
+         self.checkpoint_manager.load_checkpoint(path=path, del_local_after_load=del_local_after_load)
+ 
+         if self._is_offload_param:
+-            offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
+\ No newline at end of file
++            offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
+diff --git a/luffy/verl/verl/mix_src/mix_trainer.py b/luffy/verl/verl/mix_src/mix_trainer.py
+index 8d2fd23..ee6f28d 100644
+--- a/luffy/verl/verl/mix_src/mix_trainer.py
++++ b/luffy/verl/verl/mix_src/mix_trainer.py
+@@ -1,133 +1,667 @@
+ # Copyright 2024 Bytedance Ltd. and/or its affiliates
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+ # You may obtain a copy of the License at
+ #
+ #     http://www.apache.org/licenses/LICENSE-2.0
+ #
+ # Unless required by applicable law or agreed to in writing, software
+ # distributed under the License is distributed on an "AS IS" BASIS,
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ """
+ FSDP PPO Trainer with Ray-based single controller.
+ This trainer supports model-agonistic model initialization with huggingface
+ """
+ 
+ import os
+ import uuid
+ from contextlib import contextmanager
+ from dataclasses import dataclass, field
+ from enum import Enum
+ from pprint import pprint
+ from typing import Type, Dict
+ from collections import defaultdict, Counter
+ 
+ import numpy as np
+ from codetiming import Timer
+ from omegaconf import OmegaConf, open_dict
+ from verl import DataProto
+ from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto, DataProtoItem
+ from verl.single_controller.base import Worker
+ from verl.single_controller.ray import RayResourcePool, RayWorkerGroup, RayClassWithInitArgs
+ from verl.single_controller.ray.base import create_colocated_worker_cls
+ from verl.trainer.ppo import core_algos
+ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
+ 
+ import torch
+ 
+ from verl.trainer.ppo.ray_trainer import (
+     RayPPOTrainer, 
+     Role, 
+     ResourcePoolManager, 
+     WorkerType, 
+     _timer, 
+     # compute_data_metrics, 
+     compute_timing_metrics, 
+     dataprotoitem_to_dataproto, 
+     # compute_advantage, 
+     reduce_metrics
+ )
+-from verl.utils.torch_functional import masked_mean
++from verl.utils.torch_functional import masked_mean, get_eos_mask
++
++
++
++
++
++def _select_group_members(
++    student_scores: torch.Tensor,
++    teacher_count: int = 4,
++    group_n: int = 5,
++    success_value: float = 1.0,
++):
++    """Select final group members without constructing trajectory tensors.
++
++    Source tuples:
++        ("student", i): current student candidate i
++        ("teacher", i): stored teacher trajectory i
++    """
++
++    scores = torch.as_tensor(student_scores).detach().cpu()
++
++    if scores.ndim != 2:
++        raise ValueError(
++            f"student_scores must have shape [batch, student_n], "
++            f"got {tuple(scores.shape)}"
++        )
++
++    if not torch.isfinite(scores).all():
++        raise ValueError("student_scores contains NaN or infinity")
++
++    if teacher_count <= 0:
++        raise ValueError(f"teacher_count must be positive, got {teacher_count}")
++
++    if group_n < 2:
++        raise ValueError(f"group_n must be at least 2, got {group_n}")
++
++    plans = []
++
++    for prompt_idx, prompt_scores in enumerate(scores):
++        correct_indices = torch.nonzero(
++            prompt_scores == success_value,
++            as_tuple=False,
++        ).flatten().tolist()
++
++        incorrect_indices = torch.nonzero(
++            prompt_scores != success_value,
++            as_tuple=False,
++        ).flatten().tolist()
++
++        if incorrect_indices:
++            # Reserve one position for a teacher and one for a wrong student.
++            selected_correct = correct_indices[:group_n - 2]
++            selected_wrong = ("student", incorrect_indices[0])
++        else:
++            # All current students are correct. Reserve only one teacher slot.
++            selected_correct = correct_indices[:group_n - 1]
++            selected_wrong = None
++
++        teacher_needed = (
++            group_n
++            - len(selected_correct)
++            - (1 if selected_wrong is not None else 0)
++        )
++
++        if teacher_needed < 1:
++            raise AssertionError("selection failed to reserve one teacher")
++
++        if teacher_needed > teacher_count:
++            raise ValueError(
++                f"Prompt {prompt_idx}: selection requires "
++                f"{teacher_needed} teachers, but only {teacher_count} exist"
++            )
++
++        plan = [
++            ("teacher", teacher_idx)
++            for teacher_idx in range(teacher_needed)
++        ]
++
++        plan.extend(
++            ("student", student_idx)
++            for student_idx in selected_correct
++        )
++
++        if selected_wrong is not None:
++            plan.append(selected_wrong)
++
++        if len(plan) != group_n:
++            raise AssertionError(
++                f"Prompt {prompt_idx}: expected {group_n} members, "
++                f"constructed {len(plan)}"
++            )
++
++        plans.append(plan)
++
++    return plans
++
++
++def _materialize_teacher_rows(
++    prompt_batch: DataProto,
++    metadata_batch: DataProto,
++    teacher_pool: torch.Tensor,
++    teacher_lengths: torch.Tensor,
++    teacher_locations,
++    eos_token_id: int,
++    pad_token_id: int,
++    response_length: int,
++) -> DataProto:
++    """
++    Materialize selected stored teachers as ordinary LUFFY rollout rows.
++
++    teacher_pool:
++        [base_batch_size, teacher_count, stored_target_length]
++
++    teacher_lengths:
++        [base_batch_size, teacher_count]
++
++    teacher_locations:
++        list[(prompt_index, teacher_index)]
++
++    Returns canonical rollout tensors:
++        prompts, responses, input_ids, attention_mask,
++        position_ids, prefix_mask
++    """
++    if not teacher_locations:
++        raise ValueError("teacher_locations must not be empty")
++
++    if teacher_pool.ndim != 3:
++        raise ValueError(
++            f"teacher_pool must have shape [B, T, L], got "
++            f"{tuple(teacher_pool.shape)}"
++        )
++
++    if teacher_lengths.shape != teacher_pool.shape[:2]:
++        raise ValueError(
++            f"teacher_lengths must have shape {tuple(teacher_pool.shape[:2])}, "
++            f"got {tuple(teacher_lengths.shape)}"
++        )
++
++    base_batch_size, teacher_count, stored_length = teacher_pool.shape
++
++    if len(prompt_batch) != base_batch_size:
++        raise ValueError(
++            f"prompt batch has {len(prompt_batch)} rows, "
++            f"teacher pool has {base_batch_size}"
++        )
++
++    if len(metadata_batch) != base_batch_size:
++        raise ValueError(
++            f"metadata batch has {len(metadata_batch)} rows, "
++            f"teacher pool has {base_batch_size}"
++        )
++
++    prompt_indices_list = []
++    teacher_indices_list = []
++
++    for prompt_index, teacher_index in teacher_locations:
++        if not 0 <= prompt_index < base_batch_size:
++            raise IndexError(
++                f"prompt index {prompt_index} outside "
++                f"[0, {base_batch_size})"
++            )
++
++        if not 0 <= teacher_index < teacher_count:
++            raise IndexError(
++                f"teacher index {teacher_index} outside "
++                f"[0, {teacher_count})"
++            )
++
++        prompt_indices_list.append(prompt_index)
++        teacher_indices_list.append(teacher_index)
++
++    prompt_device = prompt_batch.batch["input_ids"].device
++    pool_device = teacher_pool.device
++
++    prompt_indices = torch.tensor(
++        prompt_indices_list,
++        dtype=torch.long,
++        device=prompt_device,
++    )
++
++    pool_prompt_indices = torch.tensor(
++        prompt_indices_list,
++        dtype=torch.long,
++        device=pool_device,
++    )
++
++    pool_teacher_indices = torch.tensor(
++        teacher_indices_list,
++        dtype=torch.long,
++        device=pool_device,
++    )
++
++    prompts = prompt_batch.batch["input_ids"].index_select(
++        0, prompt_indices
++    )
++    prompt_attention_mask = prompt_batch.batch[
++        "attention_mask"
++    ].index_select(0, prompt_indices)
++    prompt_position_ids = prompt_batch.batch[
++        "position_ids"
++    ].index_select(0, prompt_indices)
++
++    selected_teachers = teacher_pool[
++        pool_prompt_indices,
++        pool_teacher_indices,
++    ].to(prompt_device)
++
++    selected_lengths = teacher_lengths[
++        pool_prompt_indices,
++        pool_teacher_indices,
++    ].to(prompt_device, dtype=torch.long)
++
++    if torch.any(selected_lengths <= 0):
++        raise ValueError("every selected teacher must contain at least one token")
++
++    if torch.any(selected_lengths > stored_length):
++        raise ValueError(
++            f"teacher length exceeds stored tensor width {stored_length}"
++        )
++
++    row_count = len(teacher_locations)
++
++    responses = torch.full(
++        (row_count, response_length),
++        fill_value=pad_token_id,
++        dtype=selected_teachers.dtype,
++        device=prompt_device,
++    )
++
++    # Preserve original LUFFY behavior:
++    # teacher content is copied first, then EOS is appended if it fits.
++    for row_index in range(row_count):
++        teacher_length = int(selected_lengths[row_index].item())
++        copied_length = min(teacher_length, response_length)
++
++        responses[row_index, :copied_length] = selected_teachers[
++            row_index, :copied_length
++        ]
++
++        if teacher_length < response_length:
++            responses[row_index, teacher_length] = eos_token_id
++
++    # Original full-prefix LUFFY marks teacher content and its appended EOS
++    # as off-policy tokens.
++    prefix_lengths = torch.clamp(
++        selected_lengths + 1,
++        max=response_length,
++    )
++
++    token_positions = torch.arange(
++        response_length,
++        device=prompt_device,
++    ).unsqueeze(0)
++
++    prefix_mask = token_positions < prefix_lengths.unsqueeze(1)
++
++    response_attention_mask = get_eos_mask(
++        response_id=responses,
++        eos_token=eos_token_id,
++        dtype=prompt_attention_mask.dtype,
++    )
++
++    response_position_offsets = torch.arange(
++        1,
++        response_length + 1,
++        dtype=prompt_position_ids.dtype,
++        device=prompt_device,
++    ).unsqueeze(0)
++
++    response_position_ids = (
++        prompt_position_ids[:, -1:]
++        + response_position_offsets
++    )
++
++    input_ids = torch.cat((prompts, responses), dim=-1)
++    attention_mask = torch.cat(
++        (prompt_attention_mask, response_attention_mask),
++        dim=-1,
++    )
++    position_ids = torch.cat(
++        (prompt_position_ids, response_position_ids),
++        dim=-1,
++    )
++
++    prompt_indices_numpy = np.asarray(
++        prompt_indices_list,
++        dtype=np.int64,
++    )
++
++    non_tensor_batch = {
++        key: value[prompt_indices_numpy]
++        for key, value in metadata_batch.non_tensor_batch.items()
++    }
++
++    return DataProto.from_dict(
++        tensors={
++            "prompts": prompts,
++            "responses": responses,
++            "input_ids": input_ids,
++            "attention_mask": attention_mask,
++            "position_ids": position_ids,
++            "prefix_mask": prefix_mask,
++        },
++        non_tensors=non_tensor_batch,
++        meta_info=prompt_batch.meta_info,
++    )
++
++
++
++
++
++def _assemble_final_groups(
++    student_batch: DataProto,
++    student_rewards: torch.Tensor,
++    teacher_batch: DataProto,
++    teacher_rewards: torch.Tensor,
++    plans,
++    teacher_locations,
++    student_n: int,
++    group_n: int,
++):
++    """
++    Assemble final contiguous GRPO groups from selected student/teacher rows.
++
++    Student rows are ordered as:
++        prompt 0: S0 ... S(student_n - 1)
++        prompt 1: S0 ... S(student_n - 1)
++        ...
++
++    Teacher rows must be ordered exactly like teacher_locations.
++
++    Returns:
++        final_batch:   DataProto with shape [B * group_n, ...]
++        final_rewards: tensor with shape [B * group_n, response_length]
++    """
++    base_batch_size = len(plans)
++    expected_student_rows = base_batch_size * student_n
++
++    if student_n <= 0:
++        raise ValueError(f"student_n must be positive, got {student_n}")
++
++    if group_n <= 0:
++        raise ValueError(f"group_n must be positive, got {group_n}")
++
++    if len(student_batch) != expected_student_rows:
++        raise ValueError(
++            f"expected {expected_student_rows} student rows, "
++            f"got {len(student_batch)}"
++        )
++
++    if student_rewards.ndim != 2:
++        raise ValueError(
++            f"student_rewards must have shape [B * student_n, R], "
++            f"got {tuple(student_rewards.shape)}"
++        )
++
++    if student_rewards.shape[0] != len(student_batch):
++        raise ValueError(
++            f"student reward rows {student_rewards.shape[0]} do not match "
++            f"student batch rows {len(student_batch)}"
++        )
++
++    if len(teacher_batch) != len(teacher_locations):
++        raise ValueError(
++            f"teacher batch contains {len(teacher_batch)} rows but "
++            f"teacher_locations contains {len(teacher_locations)} entries"
++        )
++
++    if teacher_rewards.ndim != 2:
++        raise ValueError(
++            f"teacher_rewards must have shape [teacher_rows, R], "
++            f"got {tuple(teacher_rewards.shape)}"
++        )
++
++    if teacher_rewards.shape[0] != len(teacher_batch):
++        raise ValueError(
++            f"teacher reward rows {teacher_rewards.shape[0]} do not match "
++            f"teacher batch rows {len(teacher_batch)}"
++        )
++
++    if student_rewards.shape[1] != teacher_rewards.shape[1]:
++        raise ValueError(
++            f"student and teacher reward lengths differ: "
++            f"{student_rewards.shape[1]} versus "
++            f"{teacher_rewards.shape[1]}"
++        )
++
++    student_tensor_keys = set(student_batch.batch.keys())
++    teacher_tensor_keys = set(teacher_batch.batch.keys())
++
++    if student_tensor_keys != teacher_tensor_keys:
++        raise ValueError(
++            "student and teacher tensor keys differ: "
++            f"student-only={sorted(student_tensor_keys - teacher_tensor_keys)}, "
++            f"teacher-only={sorted(teacher_tensor_keys - student_tensor_keys)}"
++        )
++
++    student_non_tensor_keys = set(student_batch.non_tensor_batch.keys())
++    teacher_non_tensor_keys = set(teacher_batch.non_tensor_batch.keys())
++
++    if student_non_tensor_keys != teacher_non_tensor_keys:
++        raise ValueError(
++            "student and teacher non-tensor keys differ: "
++            f"student-only="
++            f"{sorted(student_non_tensor_keys - teacher_non_tensor_keys)}, "
++            f"teacher-only="
++            f"{sorted(teacher_non_tensor_keys - student_non_tensor_keys)}"
++        )
++
++    if len(set(teacher_locations)) != len(teacher_locations):
++        raise ValueError(
++            "teacher_locations contains duplicate prompt/teacher pairs"
++        )
++
++    combined_batch = DataProto.concat([
++        student_batch,
++        teacher_batch,
++    ])
++
++    combined_rewards = torch.cat(
++        (
++            student_rewards,
++            teacher_rewards.to(student_rewards.device),
++        ),
++        dim=0,
++    )
++
++    teacher_row_by_location = {
++        location: expected_student_rows + row_index
++        for row_index, location in enumerate(teacher_locations)
++    }
++
++    final_indices = []
++
++    for prompt_index, plan in enumerate(plans):
++        if len(plan) != group_n:
++            raise ValueError(
++                f"prompt {prompt_index} has a plan with {len(plan)} rows; "
++                f"expected group_n={group_n}"
++            )
++
++        for source, source_index in plan:
++            if source == "student":
++                if not 0 <= source_index < student_n:
++                    raise IndexError(
++                        f"student index {source_index} outside "
++                        f"[0, {student_n})"
++                    )
++
++                final_indices.append(
++                    prompt_index * student_n + source_index
++                )
++
++            elif source == "teacher":
++                location = (prompt_index, source_index)
++
++                if location not in teacher_row_by_location:
++                    raise KeyError(
++                        f"teacher {location} appears in the selection plan "
++                        f"but was not materialized"
++                    )
++
++                final_indices.append(
++                    teacher_row_by_location[location]
++                )
++
++            else:
++                raise ValueError(
++                    f"unknown group-member source {source!r}; "
++                    f"expected 'student' or 'teacher'"
++                )
++
++    expected_final_rows = base_batch_size * group_n
++
++    if len(final_indices) != expected_final_rows:
++        raise RuntimeError(
++            f"assembled {len(final_indices)} indices; "
++            f"expected {expected_final_rows}"
++        )
++
++    final_indices_cpu = torch.tensor(
++        final_indices,
++        dtype=torch.long,
++    )
++
++    final_tensors = {
++        key: tensor.index_select(
++            0,
++            final_indices_cpu.to(tensor.device),
++        )
++        for key, tensor in combined_batch.batch.items()
++    }
++
++    final_indices_numpy = np.asarray(
++        final_indices,
++        dtype=np.int64,
++    )
++
++    final_non_tensors = {
++        key: values[final_indices_numpy]
++        for key, values in combined_batch.non_tensor_batch.items()
++    }
++
++    final_batch = DataProto.from_dict(
++        tensors=final_tensors,
++        non_tensors=final_non_tensors,
++        meta_info=student_batch.meta_info,
++    )
++
++    final_rewards = combined_rewards.index_select(
++        0,
++        final_indices_cpu.to(combined_rewards.device),
++    )
++
++    # GRPO uses UID, not row adjacency alone, to identify each group.
++    if "uid" not in final_batch.non_tensor_batch:
++        raise KeyError("final batch has no 'uid' field")
++
++    final_uids = final_batch.non_tensor_batch["uid"]
++
++    for prompt_index in range(base_batch_size):
++        group_start = prompt_index * group_n
++        group_end = group_start + group_n
++        group_uids = final_uids[group_start:group_end]
++
++        if not np.all(group_uids == group_uids[0]):
++            raise ValueError(
++                f"assembled group {prompt_index} contains multiple UIDs: "
++                f"{group_uids.tolist()}"
++            )
++
++    return final_batch, final_rewards
++
++
++
+ 
+ 
+ # directly copied from verl/trainer/ppo/ray_trainer.py
+ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty='kl'):
+     responses = data.batch['responses']
+     response_length = responses.size(1)
+     token_level_scores = data.batch['token_level_scores']
+     batch_size = data.batch.batch_size[0]
+     attention_mask = data.batch['attention_mask']
+     response_mask = attention_mask[:, -response_length:]
+ 
+     # compute kl between ref_policy and current policy
+     if 'ref_log_prob' in data.batch.keys():
+         kld = core_algos.kl_penalty(data.batch['old_log_probs'], data.batch['ref_log_prob'],
+                                     kl_penalty=kl_penalty)  # (batch_size, response_length)
+         kld = kld * response_mask
+         beta = kl_ctrl.value
+     else:
+         beta = 0
+         kld = torch.zeros_like(response_mask, dtype=torch.float32)
+ 
+     token_level_rewards = token_level_scores - beta * kld
+ 
+     current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence
+     current_kl = torch.mean(current_kl, dim=0).item()
+ 
+     # according to https://github.com/huggingface/trl/blob/951ca1841f29114b969b57b26c7d3e80a39f75a0/trl/trainer/ppo_trainer.py#L837
+     kl_ctrl.update(current_kl=current_kl, n_steps=batch_size)
+     data.batch['token_level_rewards'] = token_level_rewards
+ 
+     metrics = {'critic/kl': current_kl, 'critic/kl_coeff': beta}
+ 
+     return data, metrics
+ 
+ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, grpo_use_std=True):
+     # prepare response group
+     # TODO: add other ways to estimate advantages
+     if adv_estimator == 'gae':
+         values = data.batch['values']
+         responses = data.batch['responses']
+         response_length = responses.size(-1)
+         attention_mask = data.batch['attention_mask']
+         response_mask = attention_mask[:, -response_length:]
+         token_level_rewards = data.batch['token_level_rewards']
+         advantages, returns = core_algos.compute_gae_advantage_return(token_level_rewards=token_level_rewards,
+                                                                       values=values,
+                                                                       eos_mask=response_mask,
+                                                                       gamma=gamma,
+                                                                       lam=lam)
+         data.batch['advantages'] = advantages
+         data.batch['returns'] = returns
+     elif adv_estimator == 'grpo':
+         token_level_rewards = data.batch['token_level_rewards']
+         index = data.non_tensor_batch['uid']
+         responses = data.batch['responses']
+         response_length = responses.size(-1)
+         attention_mask = data.batch['attention_mask']
+         response_mask = attention_mask[:, -response_length:]
+         advantages, returns = core_algos.compute_grpo_outcome_advantage(token_level_rewards=token_level_rewards,
+                                                                         eos_mask=response_mask,
+                                                                         index=index,
+                                                                         use_std=grpo_use_std)
+         data.batch['advantages'] = advantages
+         data.batch['returns'] = returns
+     elif adv_estimator == 'grpo_split':
+         token_level_rewards = data.batch['token_level_rewards']
+         index = data.non_tensor_batch['uid']
+         responses = data.batch['responses']
+         response_length = responses.size(-1)
+         attention_mask = data.batch['attention_mask']
+         response_mask = attention_mask[:, -response_length:]
+         prefix_mask = data.batch['prefix_mask']
+         on_policy_mask = ~prefix_mask.any(-1)
+         from .mix_core_alg import compute_grpo_outcome_advantage_split
+         advantages, returns = compute_grpo_outcome_advantage_split(
+             token_level_rewards=token_level_rewards,
+             eos_mask=response_mask,
+             index=index,
+             on_policy_mask=on_policy_mask,
+             use_std=grpo_use_std)
+@@ -225,287 +759,574 @@ class MIXRayPPOTrainer(RayPPOTrainer):
+                                                      role='actor_rollout')
+             self.resource_pool_to_cls[resource_pool]['actor_rollout'] = actor_rollout_cls
+         else:
+             raise NotImplementedError
+ 
+         # create critic
+         if self.config.algorithm.adv_estimator == 'gae':
+             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
+             critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=self.config.critic)
+             self.resource_pool_to_cls[resource_pool]['critic'] = critic_cls
+             self.use_critic = True
+         elif self.config.algorithm.adv_estimator == 'grpo':
+             self.use_critic = False
+         elif self.config.algorithm.adv_estimator == 'grpo_split':
+             self.use_critic = False
+         elif self.config.algorithm.adv_estimator == 'reinforce':
+             self.use_critic = False
+         elif self.config.algorithm.adv_estimator == 'reinforce_plus_plus':
+             self.use_critic = False
+         else:
+             raise NotImplementedError
+ 
+         # create reference policy if needed
+         if self.use_reference_policy:
+             resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
+             ref_policy_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RefPolicy],
+                                                   config=self.config.actor_rollout_ref,
+                                                   role='ref')
+             self.resource_pool_to_cls[resource_pool]['ref'] = ref_policy_cls
+ 
+         # create a reward model if reward_fn is None
+         if self.use_rm:
+             # we create a RM here
+             resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
+             rm_cls = RayClassWithInitArgs(self.role_worker_mapping[Role.RewardModel], config=self.config.reward_model)
+             self.resource_pool_to_cls[resource_pool]['rm'] = rm_cls
+ 
+         # initialize WorkerGroup
+         # NOTE: if you want to use a different resource pool for each role, which can support different parallel size,
+         # you should not use `create_colocated_worker_cls`. Instead, directly pass different resource pool to different worker groups.
+         # See https://github.com/volcengine/verl/blob/master/examples/ray/tutorial.ipynb for more information.
+         all_wg = {}
+         self.wg_dicts = []
+         for resource_pool, class_dict in self.resource_pool_to_cls.items():
+             worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
+             wg_dict = self.ray_worker_group_cls(resource_pool=resource_pool, ray_cls_with_init=worker_dict_cls)
+             spawn_wg = wg_dict.spawn(prefix_set=class_dict.keys())
+             all_wg.update(spawn_wg)
+             # keep the referece of WorkerDict to support ray >= 2.31. Ref: https://github.com/ray-project/ray/pull/45699
+             self.wg_dicts.append(wg_dict)
+ 
+         if self.use_critic:
+             self.critic_wg = all_wg['critic']
+             self.critic_wg.init_model()
+ 
+         if self.use_reference_policy:
+             self.ref_policy_wg = all_wg['ref']
+             self.ref_policy_wg.init_model()
+ 
+         if self.use_rm:
+             self.rm_wg = all_wg['rm']
+             self.rm_wg.init_model()
+ 
+         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
+         self.actor_rollout_wg = all_wg['actor_rollout']
+         self.actor_rollout_wg.init_model()
+ 
+     def _create_dataloader(self):
+         # TODO: we have to make sure the batch size is divisible by the dp size
+         from torch.utils.data import DataLoader, SequentialSampler
+         from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
+         from .rl_dataset_with_target import RLHFDatasetWithTarget
+         self.train_dataset = RLHFDatasetWithTarget(parquet_files=self.config.data.train_files,
+                                          tokenizer=self.tokenizer,
+                                          prompt_key=self.config.data.prompt_key,
+                                          max_prompt_length=self.config.data.max_prompt_length,
+                                          filter_prompts=True, return_raw_chat=self.config.data.get('return_raw_chat', False),
+                                          truncation='error',
+                                          max_target_length=self.config.actor_rollout_ref.rollout.max_prefix_len,
+                                          filter_targets=self.config.data.get('filter_targets', False),
+-                                         sample_target_ratio=self.config.data.get('sample_target_ratio', 1.0))
++                                         sample_target_ratio=self.config.data.get('sample_target_ratio', 1.0),
++                                         target_list_key=self.config.data.get(
++                                             'teacher_pool_key',
++                                             'target_lst',
++                                         ),
++                                         max_num_targets=self.config.data.get(
++                                             'teacher_pool_size',
++                                             4,
++                                             ))
+ 
+         # use sampler for better ckpt resume
+         if self.config.data.shuffle:
+             from verl.mix_src.rl_dataset_with_target import ResumableRandomSampler
+             sampler = ResumableRandomSampler(data_source=self.train_dataset)
+         else:
+             sampler = SequentialSampler(data_source=self.train_dataset)
+ 
+         self.train_dataloader = DataLoader(dataset=self.train_dataset,
+                                            batch_size=self.config.data.train_batch_size,
+                                            drop_last=True,
+                                            collate_fn=collate_fn,
+                                            sampler=sampler)
+         
+         self.val_dataset = RLHFDataset(parquet_files=self.config.data.val_files,
+                                        tokenizer=self.tokenizer,
+                                        prompt_key=self.config.data.prompt_key,
+                                        max_prompt_length=self.config.data.max_prompt_length,
+                                        filter_prompts=True,
+                                        return_raw_chat=self.config.data.get('return_raw_chat', False),
+                                        truncation='error')
+         self.val_dataloader = DataLoader(dataset=self.val_dataset,
+                                          batch_size=len(self.val_dataset),
+                                          shuffle=True,
+                                          drop_last=True,
+                                          collate_fn=collate_fn)
+ 
+         assert len(self.train_dataloader) >= 1
+         assert len(self.val_dataloader) >= 1
+ 
+         print(f'Size of train dataloader: {len(self.train_dataloader)}')
+         print(f'Size of val dataloader: {len(self.val_dataloader)}')
+ 
+         # inject total_training_steps to actor/critic optim_config. This is hacky.
+         total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
+ 
+         if self.config.trainer.total_training_steps is not None:
+             total_training_steps = self.config.trainer.total_training_steps
+ 
+         self.total_training_steps = total_training_steps
+         print(f'Total training steps: {self.total_training_steps}')
+ 
+         OmegaConf.set_struct(self.config, True)
+         with open_dict(self.config):
+             self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
+             self.config.critic.optim.total_training_steps = total_training_steps
+ 
+     def fit(self):
+         """
+         The training loop of PPO.
+         The driver process only need to call the compute functions of the worker group through RPC to construct the PPO dataflow.
+         The light-weight advantage computation is done on the driver process.
+         """
+         from verl.utils.tracking import Tracking
+         from omegaconf import OmegaConf
+ 
+         logger = Tracking(project_name=self.config.trainer.project_name,
+                           experiment_name=self.config.trainer.experiment_name,
+                           default_backend=self.config.trainer.logger,
+                           config=OmegaConf.to_container(self.config, resolve=True))
+ 
+         self.global_steps = 0
+ 
+         # load checkpoint before doing anything
+         self._load_checkpoint()
+ 
+         # perform validation before training
+         if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True):
+             val_metrics = self._validate()
+             pprint(f'Initial validation metrics: {val_metrics}')
+             logger.log(data=val_metrics, step=self.global_steps)
+             if self.config.trainer.get('val_only', False):
+                 return
+ 
+         # we start from step 1
+         self.global_steps += 1
+ 
+-        n_samples = self.config.actor_rollout_ref.rollout.n
+-        if self.config.data.get('add_tgt_with_acc', False):
+-            n_samples = n_samples - 1 # if filter tgt with acc, we either use tgt or on policy samples.
++        #n_samples = self.config.actor_rollout_ref.rollout.n
++        #if self.config.data.get('add_tgt_with_acc', False):
++        #    n_samples = n_samples - 1 # if filter tgt with acc, we either use tgt or on policy samples.
++        student_n = int(self.config.actor_rollout_ref.rollout.n)
++        group_n = int(
++            self.config.actor_rollout_ref.rollout.get(
++                "group_n",
++                student_n,
++            )
++        )
++
++        if student_n <= 0:
++            raise ValueError(
++                f"rollout.n must be positive, got {student_n}"
++            )
++
++        if group_n <= 0:
++            raise ValueError(
++                f"rollout.group_n must be positive, got {group_n}"
++            )
++
++        # Retained for the existing optional SFT-prefix code below.
++        n_samples = group_n
++        if self.config.data.get("add_tgt_with_acc", False):
++            n_samples -= 1
++
++
++
++
++
+ 
+         for _ in range(self.config.trainer.total_epochs):
+             
+             for batch_dict in self.train_dataloader:
+                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+ 
+                 metrics = {}
+                 timing_raw = {}
+ 
+                 # pop those keys for generation
++                """
+                 gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids', 'tgt_input_ids'])
+                 gen_batch.meta_info['global_steps'] = self.global_steps
+ 
+                 with _timer('step', timing_raw):
+                     # generate a batch
+                     with _timer('gen', timing_raw):
+                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                     
+                     # This code matches a prompt ID with its N responses.
+                     batch.non_tensor_batch['uid'] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))],
+                                                              dtype=object)
+                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                     batch = batch.union(gen_batch_output)
+                     # log avg prefix ratio
+                     if 'prefix_ratios' in gen_batch_output.meta_info.keys():
+                         metrics['batch/avg_prefix_ratio'] = float(np.mean(gen_batch_output.meta_info['prefix_ratios']))
+                     
+                     if self.config.trainer.add_full_target_when_none:
+                         pass
+ 
+                     # compute values
+                     if self.use_critic:
+                         with _timer('values', timing_raw):
+                             values = self.critic_wg.compute_values(batch)
+                             batch = batch.union(values)
+ 
+                     with _timer('adv', timing_raw):
+                         # compute scores using reward model and/or reward function
+                         if self.use_rm:
+                             reward_tensor = self.rm_wg.compute_rm_score(batch)
+                             batch = batch.union(reward_tensor)
+ 
+                         reward_tensor = self.reward_fn(batch) # [bsz, l], only the last valid token has reward
+ 
+                         batch.batch['token_level_scores'] = reward_tensor
+-                        
++                """ 
++                                # Keep generation inputs, teacher storage and metadata separate.
++                #
++                # prompt_batch:
++                #     [B] prompt tensors used by vLLM and teacher materialization
++                #
++                # teacher_pool_batch:
++                #     [B, 4, L] stored teachers; never sent to vLLM
++                #
++                # batch:
++                #     [B] non-tensor metadata, later repeated/reindexed
++                prompt_batch = batch.pop(
++                    batch_keys=[
++                        "input_ids",
++                        "attention_mask",
++                        "position_ids",
++                    ]
++                )
++
++                teacher_pool_batch = batch.pop(
++                    batch_keys=[
++                        "tgt_input_ids",
++                        "tgt_input_ids_lst",
++                        "tgt_lengths_lst",
++                    ]
++                )
++
++                base_batch_size = len(batch)
++
++                if len(prompt_batch) != base_batch_size:
++                    raise ValueError(
++                        f"prompt batch has {len(prompt_batch)} rows but "
++                        f"metadata batch has {base_batch_size}"
++                    )
++
++                teacher_pool = teacher_pool_batch.batch[
++                    "tgt_input_ids_lst"
++                ]
++                teacher_lengths = teacher_pool_batch.batch[
++                    "tgt_lengths_lst"
++                ]
++
++                if teacher_pool.shape[0] != base_batch_size:
++                    raise ValueError(
++                        f"teacher pool has {teacher_pool.shape[0]} prompts "
++                        f"but batch has {base_batch_size}"
++                    )
++
++                configured_teacher_count = int(
++                    self.config.data.get("teacher_pool_size", 4)
++                )
++                actual_teacher_count = int(teacher_pool.shape[1])
++
++                if actual_teacher_count != configured_teacher_count:
++                    raise ValueError(
++                        f"configured teacher_pool_size="
++                        f"{configured_teacher_count}, but dataset returned "
++                        f"{actual_teacher_count} teachers per prompt"
++                    )
++
++                # No tgt_input_ids is present here. Therefore vLLM generates
++                # student trajectories only.
++                gen_batch = prompt_batch
++                gen_batch.meta_info["global_steps"] = self.global_steps
++
++                with _timer("step", timing_raw):
++                    with _timer("gen", timing_raw):
++                        student_output = (
++                            self.actor_rollout_wg.generate_sequences(
++                                gen_batch
++                            )
++                        )
++
++                    expected_student_rows = (
++                        base_batch_size * student_n
++                    )
++
++                    if len(student_output) != expected_student_rows:
++                        raise ValueError(
++                            f"vLLM returned {len(student_output)} rows; "
++                            f"expected {base_batch_size} prompts * "
++                            f"{student_n} students = "
++                            f"{expected_student_rows}"
++                        )
++
++                    # One UID per original prompt. Repeating with interleave=True
++                    # gives the same UID to S0...S(student_n-1).
++                    batch.non_tensor_batch["uid"] = np.array(
++                        [
++                            str(uuid.uuid4())
++                            for _ in range(base_batch_size)
++                        ],
++                        dtype=object,
++                    )
++
++                    student_metadata = batch.repeat(
++                        repeat_times=student_n,
++                        interleave=True,
++                    )
++
++                    student_batch = student_metadata.union(
++                        student_output
++                    )
++
++                    # Prompt-only vLLM generation does not create prefix_mask.
++                    # Every student response is fully on-policy.
++                    student_batch.batch["prefix_mask"] = torch.zeros_like(
++                        student_batch.batch["responses"],
++                        dtype=torch.bool,
++                    )
++
++                    # Grade all four current-policy students exactly once.
++                    with _timer("student_reward", timing_raw):
++                        if self.use_rm:
++                            student_rm_scores = (
++                                self.rm_wg.compute_rm_score(
++                                    student_batch
++                                )
++                            )
++                            student_batch = student_batch.union(
++                                student_rm_scores
++                            )
++
++                        student_rewards = self.reward_fn(
++                            student_batch
++                        )
++
++                    if student_rewards.shape != (
++                        expected_student_rows,
++                        student_batch.batch["responses"].shape[-1],
++                    ):
++                        raise ValueError(
++                            f"student reward shape "
++                            f"{tuple(student_rewards.shape)} does not match "
++                            f"expected "
++                            f"({expected_student_rows}, "
++                            f"{student_batch.batch['responses'].shape[-1]})"
++                        )
++
++                    student_scores = student_rewards.sum(
++                        dim=-1
++                    ).reshape(
++                        base_batch_size,
++                        student_n,
++                    )
++
++                    plans = _select_group_members(
++                        student_scores=student_scores,
++                        teacher_count=actual_teacher_count,
++                        group_n=group_n,
++                    )
++
++                    # Materialize only teachers that appear in a final plan.
++                    # The order here must be preserved when teacher_batch is
++                    # passed to _assemble_final_groups.
++                    teacher_locations = [
++                        (prompt_index, member_index)
++                        for prompt_index, plan in enumerate(plans)
++                        for source, member_index in plan
++                        if source == "teacher"
++                    ]
++
++                    with _timer(
++                        "teacher_materialization",
++                        timing_raw,
++                    ):
++                        teacher_batch = _materialize_teacher_rows(
++                            prompt_batch=prompt_batch,
++                            metadata_batch=batch,
++                            teacher_pool=teacher_pool,
++                            teacher_lengths=teacher_lengths,
++                            teacher_locations=teacher_locations,
++                            eos_token_id=self.tokenizer.eos_token_id,
++                            pad_token_id=self.tokenizer.pad_token_id,
++                            response_length=student_batch.batch[
++                                "responses"
++                            ].shape[-1],
++                        )
++
++                    # Grade selected teachers with the same verifier used for
++                    # students. We do not assume teacher reward == 1.
++                    with _timer("teacher_reward", timing_raw):
++                        if self.use_rm:
++                            teacher_rm_scores = (
++                                self.rm_wg.compute_rm_score(
++                                    teacher_batch
++                                )
++                            )
++                            teacher_batch = teacher_batch.union(
++                                teacher_rm_scores
++                            )
++
++                        teacher_rewards = self.reward_fn(
++                            teacher_batch
++                        )
++
++                    batch, reward_tensor = _assemble_final_groups(
++                        student_batch=student_batch,
++                        student_rewards=student_rewards,
++                        teacher_batch=teacher_batch,
++                        teacher_rewards=teacher_rewards,
++                        plans=plans,
++                        teacher_locations=teacher_locations,
++                        student_n=student_n,
++                        group_n=group_n,
++                    )
++
++                    expected_final_rows = (
++                        base_batch_size * group_n
++                    )
++
++                    if len(batch) != expected_final_rows:
++                        raise RuntimeError(
++                            f"assembled batch has {len(batch)} rows; "
++                            f"expected {expected_final_rows}"
++                        )
++
++                    metrics["batch/generated_students"] = (
++                        expected_student_rows
++                    )
++                    metrics["batch/selected_students"] = (
++                        expected_final_rows
++                        - len(teacher_locations)
++                    )
++                    metrics["batch/selected_teachers"] = len(
++                        teacher_locations
++                    )
++                    metrics["batch/teacher_fraction"] = (
++                        len(teacher_locations)
++                        / expected_final_rows
++                    )
++                    metrics["batch/student_success_rate"] = (
++                        student_scores.eq(1).float().mean().item()
++                    )
++
++                    # Values must be computed on the selected five-row batch,
++                    # not on the four-candidate student batch.
++                    if self.use_critic:
++                        with _timer("values", timing_raw):
++                            values = self.critic_wg.compute_values(
++                                batch
++                            )
++                            batch = batch.union(values)
++
++                    with _timer("adv", timing_raw):
++                        batch.batch["token_level_scores"] = (
++                            reward_tensor
++                        )
++
++
++
++
+                         # Rejection sampling based on rewards
+                         # Group rewards by uid
+                         uids = batch.non_tensor_batch['uid']
+                         unique_uids = np.unique(uids)
+                         valid_mask = torch.ones(len(uids), dtype=torch.bool)
+                         
+                         if self.config.data.reward_impl_version == 0:
+                             fail_value = 0
+                             success_value = 1
+                             format_value = -1 # not defined.
+                         elif self.config.data.reward_impl_version == 1:
+                             fail_value = -0.5
+                             success_value = 1
+                             format_value = -1
+                         elif self.config.data.reward_impl_version == 2:
+                             fail_value = 0
+                             success_value = 1
+                             format_value = -1
+                         elif self.config.data.reward_impl_version == 3:
+                             fail_value = 0
+                             success_value = 1
+                             format_value = -1
+                         elif self.config.data.reward_impl_version == 4:
+                             fail_value = 0
+                             success_value = 1
+                             format_value = -1
+                         else:
+                             raise ValueError(f'Invalid reward implementation version: {self.config.data.reward_impl_version}')
+                         
+                         solve_none = 0
+                         solve_all = 0
+                         solve_none_format = 0
+                         for uid in unique_uids:
+                             uid_mask = uids == uid
+                             uid_rewards = reward_tensor[uid_mask].sum(-1)  # Sum rewards for each sequence
+                             
+                             # Check if all rewards are 0 or all are 1 for this uid
+                             if (uid_rewards == fail_value).all():
+                                 valid_mask[uid_mask] = False
+                                 solve_none += 1
+                             elif (uid_rewards == success_value).all():
+                                 valid_mask[uid_mask] = False
+                                 solve_all += 1
+                             elif (uid_rewards == format_value).all():
+                                 valid_mask[uid_mask] = False
+                                 solve_none_format += 1
+ 
+                         if self.config.trainer.skip_valid_mask:
+                             valid_mask[:] = True
+                         # Log to metrics
+                         metrics['batch/solve_none'] = solve_none
+                         metrics['batch/solve_none_format'] = solve_none_format
+                         metrics['batch/solve_all'] = solve_all
+ 
+                         # add more metrics
+                         metrics['batch/solved'] = (reward_tensor.sum(-1) == success_value).sum().item() / len(uids)
+                         metrics['batch/failed'] = (reward_tensor.sum(-1) == fail_value).sum().item() / len(uids)
+                         # add on-policy metrics
+                         prefix_mask = batch.batch['prefix_mask']
+                         off_policy_mask = prefix_mask.any(-1)
+                         on_policy_mask = ~off_policy_mask
+                         metrics['batch/on_solved'] = (reward_tensor[on_policy_mask].sum(-1) == success_value).sum().item() / (on_policy_mask.sum().item() + 1e-6)
+                         metrics['batch/off_solved'] = (reward_tensor[off_policy_mask].sum(-1) == success_value).sum().item() / (off_policy_mask.sum().item() + 1e-6)
+                         
+                         # recompute old_log_probs
+                         with _timer('old_log_prob', timing_raw):
+                             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                             batch = batch.union(old_log_prob)
+ 
+                         if self.use_reference_policy:
+                             # compute reference log_prob
+                             with _timer('ref', timing_raw):
+                                 ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                                 batch = batch.union(ref_log_prob)
+ 
+                         # compute rewards with KL penalty if needed
+ 
+                         # Note: This kl penalty applied directly over the rewards is disabled for GRPO. The kl penalty is applied at dp_actor.py
+                         # where it is subtracted directly from the policy loss
+ 
+@@ -679,81 +1500,81 @@ def compute_data_metrics_ours(batch, use_critic=True):
+     valid_returns = torch.masked_select(returns, response_mask)
+ 
+     if use_critic:
+         values = batch.batch['values']
+         valid_values = torch.masked_select(values, response_mask)
+         return_diff_var = torch.var(valid_returns - valid_values)
+         return_var = torch.var(valid_returns)
+ 
+     metrics = {
+         # score
+         'critic/score/mean':
+             torch.mean(sequence_score).detach().item(),
+         'critic/score/max':
+             torch.max(sequence_score).detach().item(),
+         'critic/score/min':
+             torch.min(sequence_score).detach().item(),
+         # reward
+         'critic/rewards/mean':
+             torch.mean(sequence_reward).detach().item(),
+         'critic/rewards/max':
+             torch.max(sequence_reward).detach().item(),
+         'critic/rewards/min':
+             torch.min(sequence_reward).detach().item(),
+         # adv
+         'critic/advantages/mean':
+             torch.mean(valid_adv).detach().item(),
+         'critic/advantages/max':
+             torch.max(valid_adv).detach().item(),
+         'critic/advantages/min':
+             torch.min(valid_adv).detach().item(),
+         # returns
+         'critic/returns/mean':
+             torch.mean(valid_returns).detach().item(),
+         'critic/returns/max':
+             torch.max(valid_returns).detach().item(),
+         'critic/returns/min':
+             torch.min(valid_returns).detach().item(),
+         **({
+             # values
+             'critic/values/mean': torch.mean(valid_values).detach().item(),
+             'critic/values/max': torch.max(valid_values).detach().item(),
+             'critic/values/min': torch.min(valid_values).detach().item(),
+             # vf explained var
+             'critic/vf_explained_var': (1.0 - return_diff_var / (return_var + 1e-5)).detach().item(),
+         } if use_critic else {}),
+ 
+         # response length
+         'response_length/mean':
+             torch.mean(response_length).detach().item(),
+         'response_length/max':
+             torch.max(response_length).detach().item(),
+         'response_length/min':
+             torch.min(response_length).detach().item(),
+         'response_length/clip_ratio':
+             torch.mean(torch.eq(response_length, max_response_length).float()).detach().item(),
+         # on/off policy response length
+         'on_off_metrics/on_response_length_mean':
+             torch.mean(on_response_length).detach().item(),
+         'on_off_metrics/off_response_length_mean':
+             torch.mean(off_response_length).detach().item(),
+         'on_off_metrics/on_score':
+             torch.mean(on_sequence_score).detach().item(),
+         'on_off_metrics/off_score':
+             torch.mean(off_sequence_score).detach().item(),
+         # 'on_off_metrics/on_prompt_score':
+         #     torch.mean(on_prompt_score).detach().item(),
+         # 'on_off_metrics/off_prompt_score':
+         #     torch.mean(off_prompt_score).detach().item(),
+         'on_off_metrics/off_on_example_ratio':
+             off_on_example_ratio,
+         # prompt length
+         'prompt_length/mean':
+             torch.mean(prompt_length).detach().item(),
+         'prompt_length/max':
+             torch.max(prompt_length).detach().item(),
+         'prompt_length/min':
+             torch.min(prompt_length).detach().item(),
+         'prompt_length/clip_ratio':
+             torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
+     }
+-    return metrics
+\ No newline at end of file
++    return metrics
+diff --git a/luffy/verl/verl/mix_src/rl_dataset_with_target.py b/luffy/verl/verl/mix_src/rl_dataset_with_target.py
+index 1143c78..b4a7871 100644
+--- a/luffy/verl/verl/mix_src/rl_dataset_with_target.py
++++ b/luffy/verl/verl/mix_src/rl_dataset_with_target.py
+@@ -7,315 +7,390 @@
+ #     http://www.apache.org/licenses/LICENSE-2.0
+ #
+ # Unless required by applicable law or agreed to in writing, software
+ # distributed under the License is distributed on an "AS IS" BASIS,
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+ from omegaconf import ListConfig
+ import os
+ from typing import List, Union
+ 
+ import pandas as pd
+ import copy 
+ 
+ import torch
+ import numpy as np
+ from torch.utils.data import Dataset, DataLoader
+ from transformers import AutoTokenizer, PreTrainedTokenizer
+ from verl.utils.fs import copy_local_path_from_hdfs
+ 
+ from verl.utils.model import compute_position_id_with_mask
+ import verl.utils.torch_functional as verl_F
+ from verl.utils.torch_functional import pad_sequence_to_length
+ 
+ 
+ import logging
+ import os
+ logger = logging.getLogger(__file__)
+ logger.setLevel(os.getenv('VERL_PPO_LOGGING_LEVEL', 'INFO'))
+ 
+ 
+ def collate_fn(data_list: list[dict]) -> dict:
+     tensors = {}
+     non_tensors = {}
+ 
+     for data in data_list:
+         for key, val in data.items():
+             if isinstance(val, torch.Tensor):
+                 if key not in tensors:
+                     tensors[key] = []
+                 tensors[key].append(val)
+             else:
+                 if key not in non_tensors:
+                     non_tensors[key] = []
+                 non_tensors[key].append(val)
+ 
+     for key, val in tensors.items():
+         tensors[key] = torch.stack(val, dim=0)
+ 
+     for key, val in non_tensors.items():
+         non_tensors[key] = np.array(val, dtype=object)
+ 
+     output = {}
+     output.update(tensors)
+     output.update(non_tensors)
+     return output
+ 
+ from verl.utils.dataset.rl_dataset import RLHFDataset
+ 
+ class RLHFDatasetWithTarget(RLHFDataset):
+     """
+     We assume the dataset contains a column that contains prompts and other information
+     """
+ 
+     def __init__(self,
+                  parquet_files: Union[str, List[str]],
+                  tokenizer: PreTrainedTokenizer,
+                  prompt_key='prompt',
+                  max_prompt_length=1024,
+                  filter_prompts=True,
+                  cache_dir='~/.cache/verl/rlhf',
+                  chat_template_func=None,
+                  return_raw_chat=False,
+                  truncation='error',
+                  target_key='target',
+                  max_target_length=8192,
+                  filter_targets=False,
+                  sample_target_ratio=1.0,
+                  target_list_key='target_lst',
+-                 max_num_targets=5,
++                 max_num_targets=4,
+                  target_probs_key='target_ds_qwen_7b_probs',
+         ):
+         super().__init__(parquet_files, tokenizer, prompt_key, max_prompt_length, filter_prompts, cache_dir, chat_template_func, return_raw_chat, truncation)
+         
+         self.max_target_length = max_target_length
+         self.filter_targets = filter_targets
+         self.target_key = target_key
+         self.sample_target_ratio = sample_target_ratio
+         self.target_list_key = target_list_key
+         self.target_probs_key = target_probs_key
+         self.max_num_targets = max_num_targets
+ 
+     def __getitem__(self, item):
+         """
+         Note that we also return the raw_input_ids so that it can be combined with other chat template
+         """
+         row_dict = self.dataframe.iloc[item].to_dict()
+ 
+         chat = row_dict.pop(self.prompt_key)
+ 
+         prompt_with_chat_template = self.tokenizer.apply_chat_template(chat, add_generation_prompt=True, tokenize=False)
+ 
+         input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(prompt=prompt_with_chat_template,
+                                                                          tokenizer=self.tokenizer,
+                                                                          max_length=self.max_prompt_length,
+                                                                          pad_token_id=self.tokenizer.pad_token_id,
+                                                                          left_pad=True,
+                                                                          truncation=self.truncation)
+ 
+         position_ids = compute_position_id_with_mask(attention_mask)
+ 
+         row_dict['input_ids'] = input_ids[0]
+         row_dict['attention_mask'] = attention_mask[0]
+         row_dict['position_ids'] = position_ids[0]
+         
+         tgt = row_dict.pop(self.target_key)
+         sample = np.random.rand() < self.sample_target_ratio
+         
+         if tgt is not None and sample is True:
+             tgt = tgt[0]
+         
+             if prompt_with_chat_template.endswith('<think>\n') and tgt['content'].startswith('<think>\n'):
+                 tgt['content'] = tgt['content'][len('<think>\n'):]
+             tgt_input_ids = self.tokenizer(tgt['content'], add_special_tokens=False, return_tensors='pt')['input_ids'].reshape(-1) # [1, l]
+ 
+             # NOTE: we don't need to do this because we add eos token id at mix_vllm_rollout.py
+             
+             # if tgt_input_ids[-1].item() != self.tokenizer.eos_token_id:
+             #     eos_tensor = torch.tensor([self.tokenizer.eos_token_id], device=tgt_input_ids.device, dtype=tgt_input_ids.dtype).reshape(-1)
+             #     tgt_input_ids = torch.cat([tgt_input_ids, eos_tensor], dim=-1)
+             
+             tgt_input_ids = tgt_input_ids.reshape(1, -1)
+         else:
+             tgt_input_ids = torch.tensor([], dtype=torch.long).reshape(1, 0) # empty target, will be pad to max_target_length
+ 
+         # padding or truncate
+         sequence_length = tgt_input_ids.shape[-1]
+         if sequence_length < self.max_target_length:
+             # right pad for tgt_input_ids
+             tgt_input_ids = pad_sequence_to_length(tgt_input_ids,
+                                             max_seq_len=self.max_target_length,
+                                             pad_token_id=self.tokenizer.pad_token_id,
+                                             left_pad=False)
+         else:
+             assert self.truncation in ('right', 'error')
+             tgt_input_ids = tgt_input_ids[:, :self.max_target_length]
+         
+         tgt_input_ids = tgt_input_ids.squeeze(0)
+ 
+         row_dict['tgt_input_ids'] = tgt_input_ids
+-        
++                # Process the fixed teacher pool.
++        if self.target_list_key not in row_dict:
++            raise KeyError(
++                f"Training row {item} has no {self.target_list_key!r}"
++            )
++
++        target_list = row_dict.pop(self.target_list_key)
++        if target_list is None:
++            raise ValueError(f"Training row {item} has no teacher pool")
++
++        # PyArrow normally returns this list column as a numpy array.
++        target_list = list(target_list)
++
++        if len(target_list) != self.max_num_targets:
++            raise ValueError(
++                f"Training row {item} must contain exactly "
++                f"{self.max_num_targets} teachers, got {len(target_list)}"
++            )
++
++        for teacher_idx, target in enumerate(target_list):
++            if not isinstance(target, (str, np.str_)):
++                raise TypeError(
++                    f"Teacher {teacher_idx} in row {item} must be a string, "
++                    f"got {type(target)!r}"
++                )
++
++        # Do not append EOS here. The future teacher-materialization helper
++        # will append EOS exactly as the original vLLM prefix path does.
++        tgt_input_ids_lst = torch.stack(
++            [
++                self._process_target(
++                    str(target),
++                    prompt_with_chat_template,
++                    add_eos=False,
++                )
++                for target in target_list
++            ],
++            dim=0,
++        )  # [4, max_target_length]
++
++        tgt_lengths_lst = []
++        for target_ids in tgt_input_ids_lst:
++            non_pad_positions = torch.nonzero(
++                target_ids != self.tokenizer.pad_token_id,
++                as_tuple=False,
++            )
++            target_length = (
++                0
++                if len(non_pad_positions) == 0
++                else int(non_pad_positions[-1, 0].item()) + 1
++            )
++
++            if target_length == 0:
++                raise ValueError(
++                    f"Training row {item} contains an empty teacher trace"
++                )
++
++            tgt_lengths_lst.append(target_length)
++
++        # Verify that the legacy target is exactly teacher T0.
++        if not torch.equal(tgt_input_ids, tgt_input_ids_lst[0]):
++            raise ValueError(
++                f"Training row {item}: target does not equal target_lst[0]"
++            )
++
++        row_dict["tgt_input_ids_lst"] = tgt_input_ids_lst
++        row_dict["tgt_lengths_lst"] = torch.tensor(
++            tgt_lengths_lst,
++            dtype=torch.long,
++        )
++
++        # Keep the legacy key temporarily so the original execution path
++        # remains functional while we modify the trainer incrementally.
++        row_dict["tgt_input_ids"] = tgt_input_ids_lst[0].clone()
++        """       
+         # process target_list
+         if getattr(self, 'target_list_key', "target_list_key") in row_dict:
+             target_list = row_dict.pop(self.target_list_key)
+             if target_list is None:
+                 tgt_input_ids_lst = [torch.zeros_like(tgt_input_ids).fill_(self.tokenizer.pad_token_id)] * self.max_num_targets
+             else:
+                 tgt_input_ids_lst = [self._process_target(tgt, prompt_with_chat_template, add_eos=True) for tgt in target_list]
+                 if len(tgt_input_ids_lst) <= self.max_num_targets:
+                     tgt_input_ids_lst.extend([torch.zeros_like(tgt_input_ids_lst[0]).fill_(self.tokenizer.pad_token_id)] * (self.max_num_targets - len(tgt_input_ids_lst)))
+                 else:
+                     tgt_input_ids_lst = tgt_input_ids_lst[:self.max_num_targets]
+             row_dict['tgt_input_ids_lst'] = torch.stack(tgt_input_ids_lst, dim=0) # [max_num_targets, max_target_length]
+-        
++        """
++
+         if getattr(self, 'target_probs_key', "target_probs_key") in row_dict:
+             target_probs = row_dict.pop(self.target_probs_key)
+             if target_probs is not None:
+                 target_probs_pt = torch.tensor(target_probs, dtype=torch.float32, device=tgt_input_ids.device)
+                 target_probs_pt = target_probs_pt.reshape(1, -1)
+                 # truncation
+                 # prompt_len = (input_ids[0] != self.tokenizer.pad_token_id).sum()
+                 tgt_len = (tgt_input_ids != self.tokenizer.pad_token_id).sum()
+                 try:
+                     assert target_probs_pt.shape[-1] == tgt_len+1
+                 except Exception as e:
+                     breakpoint()
+                 
+                 # same padding as tgt_input_ids
+                 if target_probs_pt.shape[-1] < self.max_target_length:
+                     target_probs_pt = pad_sequence_to_length(target_probs_pt,
+                                                 max_seq_len=self.max_target_length,
+                                                 pad_token_id=-1,
+                                                 left_pad=False)
+                 else:
+                     assert self.truncation in ('right', 'error')
+                     target_probs_pt = target_probs_pt[:, :self.max_target_length]
+                 row_dict['target_probs'] = target_probs_pt.squeeze(0) # [max_target_length]
+             else:
+                 row_dict['target_probs'] = torch.zeros_like(tgt_input_ids, dtype=torch.float32, device=tgt_input_ids.device).fill_(-1)
+ 
+         # encode prompts without chat template
+         if self.return_raw_chat:
+             row_dict['raw_prompt'] = chat.tolist()
+ 
+         # add index for each prompt
+         index = row_dict.get("extra_info", {}).get("index", 0)
+         row_dict["index"] = index
+ 
+         return row_dict
+ 
+     def _process_target(self, tgt: str, prompt: str, add_eos=False) -> torch.Tensor:
+         if prompt.endswith('<think>\n') and tgt.startswith('<think>\n'):
+             tgt = tgt[len('<think>\n'):]
+         tgt_input_ids = self.tokenizer(tgt, add_special_tokens=False, return_tensors='pt')['input_ids'].reshape(-1) # [1, l]
+         if add_eos:
+             tgt_input_ids = torch.cat([tgt_input_ids, torch.tensor([self.tokenizer.eos_token_id], device=tgt_input_ids.device, dtype=tgt_input_ids.dtype).reshape(-1)])
+ 
+         tgt_input_ids = tgt_input_ids.reshape(1, -1)
+         # padding or truncate
+         sequence_length = tgt_input_ids.shape[-1]
+         if sequence_length < self.max_target_length:
+             # right pad for tgt_input_ids
+             tgt_input_ids = pad_sequence_to_length(tgt_input_ids,
+                                             max_seq_len=self.max_target_length,
+                                             pad_token_id=self.tokenizer.pad_token_id,
+                                             left_pad=False)
+         else:
+             assert self.truncation in ('right', 'error')
+             tgt_input_ids = tgt_input_ids[:, :self.max_target_length]
+         
+         tgt_input_ids = tgt_input_ids.squeeze(0)
+ 
+         return tgt_input_ids
+ 
+ from verl import DataProto
+ class BufferedDataLoader:
+     def __init__(self, dataloader):
+         self.dataloader = dataloader
+         self.batch_size = dataloader.batch_size
+         self.buffer = []
+         self.dataloader_iter = None
+ 
+     def start_new_epoch(self):
+         """Reset for new epoch"""
+         self.dataloader_iter = iter(self.dataloader)
+ 
+     def get_next_batch(self):
+         try:
+             return next(self.dataloader_iter)
+         except StopIteration:
+             raise StopIteration
+ 
+     def __len__(self):
+         return len(self.dataloader)
+ 
+     def add_to_buffer(self, samples):
+         if len(self.buffer) == 0:
+             self.buffer = samples
+         else:
+             self.buffer = DataProto.concat([self.buffer, samples])
+ 
+     def get_from_buffer(self, count, dp_size):
+         if count > self.buffer_size():
+             count = (self.buffer_size() // dp_size) * dp_size
+         samples = self.buffer.slice(range(0, count))
+         self.buffer = self.buffer.slice(range(count, self.buffer_size()))
+         return samples
+ 
+     def buffer_size(self):
+         return len(self.buffer)
+ 
+ import torch
+ 
+ class ResumableRandomSampler(torch.utils.data.Sampler):
+     r"""Samples elements randomly. If without replacement, then sample from a shuffled dataset.
+     If with replacement, then user can specify :attr:`num_samples` to draw.
+     Arguments:
+         data_source (Dataset): dataset to sample from
+         replacement (bool): samples are drawn on-demand with replacement if ``True``, default=``False``
+         num_samples (int): number of samples to draw, default=`len(dataset)`. This argument
+             is supposed to be specified only when `replacement` is ``True``.
+         generator (Generator): Generator used in sampling.
+     """
+     #data_source: Sized
+     #replacement: bool
+ 
+     def __init__(self, data_source):
+         self.data_source = data_source
+         self.generator = torch.Generator()
+         self.generator.manual_seed(47)
+         
+         self.perm_index = 0
+         self.perm = torch.randperm(self.num_samples, generator=self.generator)
+         
+     @property
+     def num_samples(self) -> int:
+         return len(self.data_source)
+ 
+     def __iter__(self):
+         if self.perm_index >= len(self.perm):
+             self.perm_index = 0
+             self.perm = torch.randperm(self.num_samples, generator=self.generator)
+             
+         while self.perm_index < len(self.perm):
+             self.perm_index += 1
+             yield self.perm[self.perm_index-1].item() # the output index should be int
+ 
+     def __len__(self):
+         return self.num_samples
+     
+     def get_state(self):
+         return {"perm": self.perm, "perm_index": self.perm_index, "generator_state": self.generator.get_state()}
+     
+     def set_state(self, state):
+         self.perm = state["perm"]
+         self.perm_index = state["perm_index"]
+         self.generator.set_state(state["generator_state"])
+ 
+ def _pre_process_inputs_right_pad(pad_token_id, prompt_token_ids: torch.Tensor) -> List[int]:
+     # remove the left padding in the prompt token_id
+     # pad_token_id = self.llm_engine.tokenizer.pad_token_id if self.llm_engine.tokenizer.pad_token_id is not None else self.llm_engine.tokenizer.eos_token_id
+     non_pad_index = torch.nonzero(prompt_token_ids != pad_token_id, as_tuple=False)
+     token_ids = prompt_token_ids[:non_pad_index[-1][0]].tolist()
+-    return token_ids
+\ No newline at end of file
++    return token_ids

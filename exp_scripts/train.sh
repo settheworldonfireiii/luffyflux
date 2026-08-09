@@ -1,11 +1,11 @@
 set -x
-export HF_ENDPOINT=https://hf-mirror.com
+export HF_ENDPOINT=https://huggingface.co
 
 eval "$(conda shell.bash hook)"
-conda activate luffy
+conda activate /scratch.global/radke149/envs/luffy
 
 # NOTE: change to your root dir
-ROOT=./LUFFY/ 
+ROOT=/scratch.global/radke149/LUFFY 
 
 ray stop 
 
@@ -20,6 +20,8 @@ export DATA_DIR=$ROOT/data/
 export EXP_NAME=LUFFY_TEST
 
 export WANDB_PROJECT="luffy-math-test"
+
+export WANDB_API_KEY="c076130b0dbf2f07f85f0eebcff868ab7631e61c"
 
 cd $ROOT/luffy/verl/
 

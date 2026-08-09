@@ -84,7 +84,8 @@ class RLHFDatasetWithTarget(RLHFDataset):
                  filter_targets=False,
                  sample_target_ratio=1.0,
                  target_list_key='target_lst',
-                 max_num_targets=5,
+                 max_num_targets=4,
+                 use_teacher_pool=True,
                  target_probs_key='target_ds_qwen_7b_probs',
         ):
         super().__init__(parquet_files, tokenizer, prompt_key, max_prompt_length, filter_prompts, cache_dir, chat_template_func, return_raw_chat, truncation)
@@ -96,6 +97,7 @@ class RLHFDatasetWithTarget(RLHFDataset):
         self.target_list_key = target_list_key
         self.target_probs_key = target_probs_key
         self.max_num_targets = max_num_targets
+        self.use_teacher_pool = use_teacher_pool
 
     def __getitem__(self, item):
         """
@@ -155,7 +157,87 @@ class RLHFDatasetWithTarget(RLHFDataset):
         tgt_input_ids = tgt_input_ids.squeeze(0)
 
         row_dict['tgt_input_ids'] = tgt_input_ids
-        
+
+        if not self.use_teacher_pool:
+            # Legacy LUFFY uses only target/T0.  Discard target_lst when the
+            # new parquet is used, and tolerate it being absent in old data.
+            row_dict.pop(self.target_list_key, None)
+        else:
+            # Process the fixed teacher pool.
+            if self.target_list_key not in row_dict:
+                raise KeyError(
+                    f"Training row {item} has no {self.target_list_key!r}"
+                )
+
+            target_list = row_dict.pop(self.target_list_key)
+            if target_list is None:
+                raise ValueError(f"Training row {item} has no teacher pool")
+
+            # PyArrow normally returns this list column as a numpy array.
+            target_list = list(target_list)
+
+            if len(target_list) != self.max_num_targets:
+                raise ValueError(
+                    f"Training row {item} must contain exactly "
+                    f"{self.max_num_targets} teachers, got {len(target_list)}"
+                )
+
+            for teacher_idx, target in enumerate(target_list):
+                if not isinstance(target, (str, np.str_)):
+                    raise TypeError(
+                        f"Teacher {teacher_idx} in row {item} must be a string, "
+                        f"got {type(target)!r}"
+                    )
+
+            # Do not append EOS here. The future teacher-materialization helper
+            # will append EOS exactly as the original vLLM prefix path does.
+            tgt_input_ids_lst = torch.stack(
+                [
+                    self._process_target(
+                        str(target),
+                        prompt_with_chat_template,
+                        add_eos=False,
+                    )
+                    for target in target_list
+                ],
+                dim=0,
+            )  # [4, max_target_length]
+
+            tgt_lengths_lst = []
+            for target_ids in tgt_input_ids_lst:
+                non_pad_positions = torch.nonzero(
+                    target_ids != self.tokenizer.pad_token_id,
+                    as_tuple=False,
+                )
+                target_length = (
+                    0
+                    if len(non_pad_positions) == 0
+                    else int(non_pad_positions[-1, 0].item()) + 1
+                )
+
+                if target_length == 0:
+                    raise ValueError(
+                        f"Training row {item} contains an empty teacher trace"
+                    )
+
+                tgt_lengths_lst.append(target_length)
+
+            # Verify that the legacy target is exactly teacher T0.
+            if not torch.equal(tgt_input_ids, tgt_input_ids_lst[0]):
+                raise ValueError(
+                    f"Training row {item}: target does not equal target_lst[0]"
+                )
+
+            row_dict["tgt_input_ids_lst"] = tgt_input_ids_lst
+            row_dict["tgt_lengths_lst"] = torch.tensor(
+                tgt_lengths_lst,
+                dtype=torch.long,
+            )
+
+            # Keep the legacy key temporarily so the original execution path
+            # remains functional while we modify the trainer incrementally.
+            row_dict["tgt_input_ids"] = tgt_input_ids_lst[0].clone()
+        """       
         # process target_list
         if getattr(self, 'target_list_key', "target_list_key") in row_dict:
             target_list = row_dict.pop(self.target_list_key)
@@ -168,7 +250,8 @@ class RLHFDatasetWithTarget(RLHFDataset):
                 else:
                     tgt_input_ids_lst = tgt_input_ids_lst[:self.max_num_targets]
             row_dict['tgt_input_ids_lst'] = torch.stack(tgt_input_ids_lst, dim=0) # [max_num_targets, max_target_length]
-        
+        """
+
         if getattr(self, 'target_probs_key', "target_probs_key") in row_dict:
             target_probs = row_dict.pop(self.target_probs_key)
             if target_probs is not None:

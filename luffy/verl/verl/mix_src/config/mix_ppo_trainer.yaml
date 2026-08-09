@@ -3,8 +3,8 @@ data:
   train_files: ~/data/rlhf/gsm8k/train.parquet
   val_files: ~/data/rlhf/gsm8k/test.parquet
   prompt_key: prompt
-  max_prompt_length: 512
-  max_response_length: 512
+  max_prompt_length: 1024
+  max_response_length: 8192
   train_batch_size: 1024
   val_batch_size: 1312
   return_raw_input_ids: False  # This should be set to true when the tokenizer between policy and rm differs
@@ -19,7 +19,8 @@ data:
   add_tgt_with_acc: False
   add_tgt_acc_upper_bound: 0.5
   disable_truncation_advantage: False
-
+  teacher_pool_key: target_lst
+  teacher_pool_size: 4
 
 actor_rollout_ref:
   hybrid_engine: True
@@ -128,6 +129,7 @@ actor_rollout_ref:
     do_sample: True
     # number of responses (i.e. num sample times)
     n: 1 # > 1 for grpo
+    group_n: ${actor_rollout_ref.rollout.n}
     n_val: 8
     # define prefix hyperparameters
     prefix_strategy: random
@@ -197,6 +199,9 @@ reward_model:
   forward_max_token_len_per_gpu: ${critic.forward_max_token_len_per_gpu}
 
 algorithm:
+  # False: original LUFFY (one pre-saved T0 prefix + n-1 students).
+  # True: grade students first, then assemble a group_n-sized group.
+  grade_before_grouping: True
   gamma: 1.0
   lam: 1.0
   adv_estimator: gae
@@ -231,5 +236,4 @@ trainer:
   skip_valid_mask: False
   acc_rebatch: False
   skip_by_step: False
-
 

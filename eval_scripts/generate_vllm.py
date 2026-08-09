@@ -1,4 +1,4 @@
-#export HF_ENDPOINT=https://hf-mirror.com  
+#export HF_ENDPOINT=https://huggingface.co  
 import os
 import json
 import pandas as pd
@@ -9,6 +9,11 @@ import torch
 
 from math_verify import parse, verify
 from oat_math_grader import boxed_reward_fn as oat_evaluate
+
+
+
+from verl.mix_src.main_mix_ppo import RewardManager
+
 
 THOUGHT_DELIMITER_START = "<think>"
 THOUGHT_DELIMITER_END = "</think>"
@@ -253,4 +258,5 @@ def generate_vllm(messages, model_path, template='own', temperature=0.6, top_p=0
 
 if __name__ == "__main__":
     import fire
+    print("ROLLOUT EXTERNAL")
     fire.Fire(main)

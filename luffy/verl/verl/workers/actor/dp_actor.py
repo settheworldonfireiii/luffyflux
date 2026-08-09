@@ -55,7 +55,7 @@ class DataParallelPPOActor(BasePPOActor):
 
         self.compute_entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=True)
 
-    def _forward_micro_batch(self, micro_batch, temperature) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _forward_micro_batch(self, micro_batch, temperature, compute_entropy = True) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns: 
             entropy: # (bs, response_len)
@@ -136,8 +136,12 @@ class DataParallelPPOActor(BasePPOActor):
                 logits.div_(temperature)
                 logits = logits[:, -response_length - 1:-1]  # (bsz, response_length)
                 log_probs = logprobs_from_logits(logits, micro_batch['responses'])
-                entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
-
+                #entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
+                entropy = (
+                    verl_F.entropy_from_logits(logits)
+                    if compute_entropy
+                    else None
+                    )
             return entropy, log_probs
 
     def _optimizer_step(self):
@@ -188,7 +192,7 @@ class DataParallelPPOActor(BasePPOActor):
         log_probs_lst = []
         for micro_batch in micro_batches:
             with torch.no_grad():
-                _, log_probs = self._forward_micro_batch(micro_batch, temperature=temperature)
+                _, log_probs = self._forward_micro_batch(micro_batch, temperature=temperature, compute_entropy=False)
             log_probs_lst.append(log_probs)
         log_probs = torch.concat(log_probs_lst, dim=0)
 

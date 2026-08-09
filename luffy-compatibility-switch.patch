@@ -1,0 +1,610 @@
+diff --git a/luffy/verl/verl/mix_src/config/mix_ppo_trainer.yaml b/luffy/verl/verl/mix_src/config/mix_ppo_trainer.yaml
+index cc65275..39d2c14 100644
+--- a/luffy/verl/verl/mix_src/config/mix_ppo_trainer.yaml
++++ b/luffy/verl/verl/mix_src/config/mix_ppo_trainer.yaml
+@@ -199,6 +199,9 @@ reward_model:
+   forward_max_token_len_per_gpu: ${critic.forward_max_token_len_per_gpu}
+ 
+ algorithm:
++  # False: original LUFFY (one pre-saved T0 prefix + n-1 students).
++  # True: grade students first, then assemble a group_n-sized group.
++  grade_before_grouping: True
+   gamma: 1.0
+   lam: 1.0
+   adv_estimator: gae
+@@ -234,4 +237,3 @@ trainer:
+   acc_rebatch: False
+   skip_by_step: False
+ 
+-
+diff --git a/luffy/verl/verl/mix_src/mix_trainer.py b/luffy/verl/verl/mix_src/mix_trainer.py
+index ee6f28d..5a65a2c 100644
+--- a/luffy/verl/verl/mix_src/mix_trainer.py
++++ b/luffy/verl/verl/mix_src/mix_trainer.py
+@@ -844,7 +844,11 @@ class MIXRayPPOTrainer(RayPPOTrainer):
+                                          max_num_targets=self.config.data.get(
+                                              'teacher_pool_size',
+                                              4,
+-                                             ))
++                                         ),
++                                         use_teacher_pool=self.config.algorithm.get(
++                                             'grade_before_grouping',
++                                             True,
++                                         ))
+ 
+         # use sampler for better ckpt resume
+         if self.config.data.shuffle:
+@@ -925,6 +929,12 @@ class MIXRayPPOTrainer(RayPPOTrainer):
+         #n_samples = self.config.actor_rollout_ref.rollout.n
+         #if self.config.data.get('add_tgt_with_acc', False):
+         #    n_samples = n_samples - 1 # if filter tgt with acc, we either use tgt or on policy samples.
++        grade_before_grouping = bool(
++            self.config.algorithm.get(
++                "grade_before_grouping",
++                True,
++            )
++        )
+         student_n = int(self.config.actor_rollout_ref.rollout.n)
+         group_n = int(
+             self.config.actor_rollout_ref.rollout.get(
+@@ -943,6 +953,12 @@ class MIXRayPPOTrainer(RayPPOTrainer):
+                 f"rollout.group_n must be positive, got {group_n}"
+             )
+ 
++        if not grade_before_grouping and group_n != student_n:
++            raise ValueError(
++                "Original LUFFY requires rollout.group_n == rollout.n; "
++                f"got group_n={group_n}, n={student_n}"
++            )
++
+         # Retained for the existing optional SFT-prefix code below.
+         n_samples = group_n
+         if self.config.data.get("add_tgt_with_acc", False):
+@@ -960,6 +976,9 @@ class MIXRayPPOTrainer(RayPPOTrainer):
+ 
+                 metrics = {}
+                 timing_raw = {}
++                metrics["batch/grade_before_grouping"] = float(
++                    grade_before_grouping
++                )
+ 
+                 # pop those keys for generation
+                 """
+@@ -1017,14 +1036,6 @@ class MIXRayPPOTrainer(RayPPOTrainer):
+                     ]
+                 )
+ 
+-                teacher_pool_batch = batch.pop(
+-                    batch_keys=[
+-                        "tgt_input_ids",
+-                        "tgt_input_ids_lst",
+-                        "tgt_lengths_lst",
+-                    ]
+-                )
+-
+                 base_batch_size = len(batch)
+ 
+                 if len(prompt_batch) != base_batch_size:
+@@ -1033,34 +1044,49 @@ class MIXRayPPOTrainer(RayPPOTrainer):
+                         f"metadata batch has {base_batch_size}"
+                     )
+ 
+-                teacher_pool = teacher_pool_batch.batch[
+-                    "tgt_input_ids_lst"
+-                ]
+-                teacher_lengths = teacher_pool_batch.batch[
+-                    "tgt_lengths_lst"
+-                ]
++                if grade_before_grouping:
++                    teacher_pool_batch = batch.pop(
++                        batch_keys=[
++                            "tgt_input_ids",
++                            "tgt_input_ids_lst",
++                            "tgt_lengths_lst",
++                        ]
++                    )
++                    teacher_pool = teacher_pool_batch.batch[
++                        "tgt_input_ids_lst"
++                    ]
++                    teacher_lengths = teacher_pool_batch.batch[
++                        "tgt_lengths_lst"
++                    ]
+ 
+-                if teacher_pool.shape[0] != base_batch_size:
+-                    raise ValueError(
+-                        f"teacher pool has {teacher_pool.shape[0]} prompts "
+-                        f"but batch has {base_batch_size}"
++                    if teacher_pool.shape[0] != base_batch_size:
++                        raise ValueError(
++                            f"teacher pool has {teacher_pool.shape[0]} prompts "
++                            f"but batch has {base_batch_size}"
++                        )
++
++                    configured_teacher_count = int(
++                        self.config.data.get("teacher_pool_size", 4)
+                     )
++                    actual_teacher_count = int(teacher_pool.shape[1])
+ 
+-                configured_teacher_count = int(
+-                    self.config.data.get("teacher_pool_size", 4)
+-                )
+-                actual_teacher_count = int(teacher_pool.shape[1])
++                    if actual_teacher_count != configured_teacher_count:
++                        raise ValueError(
++                            f"configured teacher_pool_size="
++                            f"{configured_teacher_count}, but dataset returned "
++                            f"{actual_teacher_count} teachers per prompt"
++                        )
+ 
+-                if actual_teacher_count != configured_teacher_count:
+-                    raise ValueError(
+-                        f"configured teacher_pool_size="
+-                        f"{configured_teacher_count}, but dataset returned "
+-                        f"{actual_teacher_count} teachers per prompt"
++                    # Prompt-only input: vLLM generates student trajectories.
++                    gen_batch = prompt_batch
++                else:
++                    # Exact original LUFFY input: vLLM receives T0 through
++                    # tgt_input_ids and creates the mixed prefix/student group.
++                    legacy_target_batch = batch.pop(
++                        batch_keys=["tgt_input_ids"]
+                     )
++                    gen_batch = prompt_batch.union(legacy_target_batch)
+ 
+-                # No tgt_input_ids is present here. Therefore vLLM generates
+-                # student trajectories only.
+-                gen_batch = prompt_batch
+                 gen_batch.meta_info["global_steps"] = self.global_steps
+ 
+                 with _timer("step", timing_raw):
+@@ -1102,139 +1128,151 @@ class MIXRayPPOTrainer(RayPPOTrainer):
+                         student_output
+                     )
+ 
+-                    # Prompt-only vLLM generation does not create prefix_mask.
+-                    # Every student response is fully on-policy.
+-                    student_batch.batch["prefix_mask"] = torch.zeros_like(
+-                        student_batch.batch["responses"],
+-                        dtype=torch.bool,
+-                    )
++                    if "prefix_ratios" in student_output.meta_info:
++                        metrics["batch/avg_prefix_ratio"] = float(
++                            np.mean(student_output.meta_info["prefix_ratios"])
++                        )
+ 
+-                    # Grade all four current-policy students exactly once.
+-                    with _timer("student_reward", timing_raw):
+-                        if self.use_rm:
+-                            student_rm_scores = (
+-                                self.rm_wg.compute_rm_score(
+-                                    student_batch
++                    if grade_before_grouping:
++                        # Prompt-only vLLM generation does not create prefix_mask.
++                        # Every student response is fully on-policy.
++                        student_batch.batch["prefix_mask"] = torch.zeros_like(
++                            student_batch.batch["responses"],
++                            dtype=torch.bool,
++                        )
++
++                        # Grade all four current-policy students exactly once.
++                        with _timer("student_reward", timing_raw):
++                            if self.use_rm:
++                                student_rm_scores = (
++                                    self.rm_wg.compute_rm_score(
++                                        student_batch
++                                    )
+                                 )
++                                student_batch = student_batch.union(
++                                    student_rm_scores
++                                )
++
++                            student_rewards = self.reward_fn(
++                                student_batch
+                             )
+-                            student_batch = student_batch.union(
+-                                student_rm_scores
++
++                        if student_rewards.shape != (
++                            expected_student_rows,
++                            student_batch.batch["responses"].shape[-1],
++                        ):
++                            raise ValueError(
++                                f"student reward shape "
++                                f"{tuple(student_rewards.shape)} does not match "
++                                f"expected "
++                                f"({expected_student_rows}, "
++                                f"{student_batch.batch['responses'].shape[-1]})"
+                             )
+ 
+-                        student_rewards = self.reward_fn(
+-                            student_batch
++                        student_scores = student_rewards.sum(
++                            dim=-1
++                        ).reshape(
++                            base_batch_size,
++                            student_n,
+                         )
+ 
+-                    if student_rewards.shape != (
+-                        expected_student_rows,
+-                        student_batch.batch["responses"].shape[-1],
+-                    ):
+-                        raise ValueError(
+-                            f"student reward shape "
+-                            f"{tuple(student_rewards.shape)} does not match "
+-                            f"expected "
+-                            f"({expected_student_rows}, "
+-                            f"{student_batch.batch['responses'].shape[-1]})"
++                        plans = _select_group_members(
++                            student_scores=student_scores,
++                            teacher_count=actual_teacher_count,
++                            group_n=group_n,
+                         )
+ 
+-                    student_scores = student_rewards.sum(
+-                        dim=-1
+-                    ).reshape(
+-                        base_batch_size,
+-                        student_n,
+-                    )
++                        # Materialize only teachers that appear in a final plan.
++                        # The order here must be preserved when teacher_batch is
++                        # passed to _assemble_final_groups.
++                        teacher_locations = [
++                            (prompt_index, member_index)
++                            for prompt_index, plan in enumerate(plans)
++                            for source, member_index in plan
++                            if source == "teacher"
++                        ]
++
++                        with _timer(
++                            "teacher_materialization",
++                            timing_raw,
++                        ):
++                            teacher_batch = _materialize_teacher_rows(
++                                prompt_batch=prompt_batch,
++                                metadata_batch=batch,
++                                teacher_pool=teacher_pool,
++                                teacher_lengths=teacher_lengths,
++                                teacher_locations=teacher_locations,
++                                eos_token_id=self.tokenizer.eos_token_id,
++                                pad_token_id=self.tokenizer.pad_token_id,
++                                response_length=student_batch.batch[
++                                    "responses"
++                                ].shape[-1],
++                            )
+ 
+-                    plans = _select_group_members(
+-                        student_scores=student_scores,
+-                        teacher_count=actual_teacher_count,
+-                        group_n=group_n,
+-                    )
++                        # Grade selected teachers with the same verifier used for
++                        # students. We do not assume teacher reward == 1.
++                        with _timer("teacher_reward", timing_raw):
++                            if self.use_rm:
++                                teacher_rm_scores = (
++                                    self.rm_wg.compute_rm_score(
++                                        teacher_batch
++                                    )
++                                )
++                                teacher_batch = teacher_batch.union(
++                                    teacher_rm_scores
++                                )
+ 
+-                    # Materialize only teachers that appear in a final plan.
+-                    # The order here must be preserved when teacher_batch is
+-                    # passed to _assemble_final_groups.
+-                    teacher_locations = [
+-                        (prompt_index, member_index)
+-                        for prompt_index, plan in enumerate(plans)
+-                        for source, member_index in plan
+-                        if source == "teacher"
+-                    ]
++                            teacher_rewards = self.reward_fn(
++                                teacher_batch
++                            )
+ 
+-                    with _timer(
+-                        "teacher_materialization",
+-                        timing_raw,
+-                    ):
+-                        teacher_batch = _materialize_teacher_rows(
+-                            prompt_batch=prompt_batch,
+-                            metadata_batch=batch,
+-                            teacher_pool=teacher_pool,
+-                            teacher_lengths=teacher_lengths,
++                        batch, reward_tensor = _assemble_final_groups(
++                            student_batch=student_batch,
++                            student_rewards=student_rewards,
++                            teacher_batch=teacher_batch,
++                            teacher_rewards=teacher_rewards,
++                            plans=plans,
+                             teacher_locations=teacher_locations,
+-                            eos_token_id=self.tokenizer.eos_token_id,
+-                            pad_token_id=self.tokenizer.pad_token_id,
+-                            response_length=student_batch.batch[
+-                                "responses"
+-                            ].shape[-1],
++                            student_n=student_n,
++                            group_n=group_n,
+                         )
+ 
+-                    # Grade selected teachers with the same verifier used for
+-                    # students. We do not assume teacher reward == 1.
+-                    with _timer("teacher_reward", timing_raw):
+-                        if self.use_rm:
+-                            teacher_rm_scores = (
+-                                self.rm_wg.compute_rm_score(
+-                                    teacher_batch
+-                                )
+-                            )
+-                            teacher_batch = teacher_batch.union(
+-                                teacher_rm_scores
+-                            )
+-
+-                        teacher_rewards = self.reward_fn(
+-                            teacher_batch
++                        expected_final_rows = (
++                            base_batch_size * group_n
+                         )
+ 
+-                    batch, reward_tensor = _assemble_final_groups(
+-                        student_batch=student_batch,
+-                        student_rewards=student_rewards,
+-                        teacher_batch=teacher_batch,
+-                        teacher_rewards=teacher_rewards,
+-                        plans=plans,
+-                        teacher_locations=teacher_locations,
+-                        student_n=student_n,
+-                        group_n=group_n,
+-                    )
+-
+-                    expected_final_rows = (
+-                        base_batch_size * group_n
+-                    )
++                        if len(batch) != expected_final_rows:
++                            raise RuntimeError(
++                                f"assembled batch has {len(batch)} rows; "
++                                f"expected {expected_final_rows}"
++                            )
+ 
+-                    if len(batch) != expected_final_rows:
+-                        raise RuntimeError(
+-                            f"assembled batch has {len(batch)} rows; "
+-                            f"expected {expected_final_rows}"
++                        metrics["batch/generated_students"] = (
++                            expected_student_rows
+                         )
+-
+-                    metrics["batch/generated_students"] = (
+-                        expected_student_rows
+-                    )
+-                    metrics["batch/selected_students"] = (
+-                        expected_final_rows
+-                        - len(teacher_locations)
+-                    )
+-                    metrics["batch/selected_teachers"] = len(
+-                        teacher_locations
+-                    )
+-                    metrics["batch/teacher_fraction"] = (
+-                        len(teacher_locations)
+-                        / expected_final_rows
+-                    )
+-                    metrics["batch/student_success_rate"] = (
+-                        student_scores.eq(1).float().mean().item()
+-                    )
+-
+-                    # Values must be computed on the selected five-row batch,
+-                    # not on the four-candidate student batch.
++                        metrics["batch/selected_students"] = (
++                            expected_final_rows
++                            - len(teacher_locations)
++                        )
++                        metrics["batch/selected_teachers"] = len(
++                            teacher_locations
++                        )
++                        metrics["batch/teacher_fraction"] = (
++                            len(teacher_locations)
++                            / expected_final_rows
++                        )
++                        metrics["batch/student_success_rate"] = (
++                            student_scores.eq(1).float().mean().item()
++                        )
++                    else:
++                        # vLLM already returned the complete original LUFFY
++                        # group: one T0-prefixed row and n-1 student rows.
++                        # Keep its ordering and prefix_mask exactly unchanged.
++                        batch = student_batch
++                        reward_tensor = None
++
++                    # In either mode values are computed only on the final
++                    # group that will be used for the PPO/GRPO update.
+                     if self.use_critic:
+                         with _timer("values", timing_raw):
+                             values = self.critic_wg.compute_values(
+@@ -1243,6 +1281,15 @@ class MIXRayPPOTrainer(RayPPOTrainer):
+                             batch = batch.union(values)
+ 
+                     with _timer("adv", timing_raw):
++                        if not grade_before_grouping:
++                            # Preserve original LUFFY order: form the mixed
++                            # group first, compute values, then grade it once.
++                            if self.use_rm:
++                                rm_scores = self.rm_wg.compute_rm_score(batch)
++                                batch = batch.union(rm_scores)
++
++                            reward_tensor = self.reward_fn(batch)
++
+                         batch.batch["token_level_scores"] = (
+                             reward_tensor
+                         )
+diff --git a/luffy/verl/verl/mix_src/rl_dataset_with_target.py b/luffy/verl/verl/mix_src/rl_dataset_with_target.py
+index b4a7871..6148fd0 100644
+--- a/luffy/verl/verl/mix_src/rl_dataset_with_target.py
++++ b/luffy/verl/verl/mix_src/rl_dataset_with_target.py
+@@ -85,6 +85,7 @@ class RLHFDatasetWithTarget(RLHFDataset):
+                  sample_target_ratio=1.0,
+                  target_list_key='target_lst',
+                  max_num_targets=4,
++                 use_teacher_pool=True,
+                  target_probs_key='target_ds_qwen_7b_probs',
+         ):
+         super().__init__(parquet_files, tokenizer, prompt_key, max_prompt_length, filter_prompts, cache_dir, chat_template_func, return_raw_chat, truncation)
+@@ -96,6 +97,7 @@ class RLHFDatasetWithTarget(RLHFDataset):
+         self.target_list_key = target_list_key
+         self.target_probs_key = target_probs_key
+         self.max_num_targets = max_num_targets
++        self.use_teacher_pool = use_teacher_pool
+ 
+     def __getitem__(self, item):
+         """
+@@ -155,80 +157,86 @@ class RLHFDatasetWithTarget(RLHFDataset):
+         tgt_input_ids = tgt_input_ids.squeeze(0)
+ 
+         row_dict['tgt_input_ids'] = tgt_input_ids
+-                # Process the fixed teacher pool.
+-        if self.target_list_key not in row_dict:
+-            raise KeyError(
+-                f"Training row {item} has no {self.target_list_key!r}"
+-            )
+ 
+-        target_list = row_dict.pop(self.target_list_key)
+-        if target_list is None:
+-            raise ValueError(f"Training row {item} has no teacher pool")
++        if not self.use_teacher_pool:
++            # Legacy LUFFY uses only target/T0.  Discard target_lst when the
++            # new parquet is used, and tolerate it being absent in old data.
++            row_dict.pop(self.target_list_key, None)
++        else:
++            # Process the fixed teacher pool.
++            if self.target_list_key not in row_dict:
++                raise KeyError(
++                    f"Training row {item} has no {self.target_list_key!r}"
++                )
+ 
+-        # PyArrow normally returns this list column as a numpy array.
+-        target_list = list(target_list)
++            target_list = row_dict.pop(self.target_list_key)
++            if target_list is None:
++                raise ValueError(f"Training row {item} has no teacher pool")
+ 
+-        if len(target_list) != self.max_num_targets:
+-            raise ValueError(
+-                f"Training row {item} must contain exactly "
+-                f"{self.max_num_targets} teachers, got {len(target_list)}"
+-            )
++            # PyArrow normally returns this list column as a numpy array.
++            target_list = list(target_list)
+ 
+-        for teacher_idx, target in enumerate(target_list):
+-            if not isinstance(target, (str, np.str_)):
+-                raise TypeError(
+-                    f"Teacher {teacher_idx} in row {item} must be a string, "
+-                    f"got {type(target)!r}"
++            if len(target_list) != self.max_num_targets:
++                raise ValueError(
++                    f"Training row {item} must contain exactly "
++                    f"{self.max_num_targets} teachers, got {len(target_list)}"
+                 )
+ 
+-        # Do not append EOS here. The future teacher-materialization helper
+-        # will append EOS exactly as the original vLLM prefix path does.
+-        tgt_input_ids_lst = torch.stack(
+-            [
+-                self._process_target(
+-                    str(target),
+-                    prompt_with_chat_template,
+-                    add_eos=False,
++            for teacher_idx, target in enumerate(target_list):
++                if not isinstance(target, (str, np.str_)):
++                    raise TypeError(
++                        f"Teacher {teacher_idx} in row {item} must be a string, "
++                        f"got {type(target)!r}"
++                    )
++
++            # Do not append EOS here. The future teacher-materialization helper
++            # will append EOS exactly as the original vLLM prefix path does.
++            tgt_input_ids_lst = torch.stack(
++                [
++                    self._process_target(
++                        str(target),
++                        prompt_with_chat_template,
++                        add_eos=False,
++                    )
++                    for target in target_list
++                ],
++                dim=0,
++            )  # [4, max_target_length]
++
++            tgt_lengths_lst = []
++            for target_ids in tgt_input_ids_lst:
++                non_pad_positions = torch.nonzero(
++                    target_ids != self.tokenizer.pad_token_id,
++                    as_tuple=False,
+                 )
+-                for target in target_list
+-            ],
+-            dim=0,
+-        )  # [4, max_target_length]
+-
+-        tgt_lengths_lst = []
+-        for target_ids in tgt_input_ids_lst:
+-            non_pad_positions = torch.nonzero(
+-                target_ids != self.tokenizer.pad_token_id,
+-                as_tuple=False,
+-            )
+-            target_length = (
+-                0
+-                if len(non_pad_positions) == 0
+-                else int(non_pad_positions[-1, 0].item()) + 1
+-            )
++                target_length = (
++                    0
++                    if len(non_pad_positions) == 0
++                    else int(non_pad_positions[-1, 0].item()) + 1
++                )
++
++                if target_length == 0:
++                    raise ValueError(
++                        f"Training row {item} contains an empty teacher trace"
++                    )
+ 
+-            if target_length == 0:
++                tgt_lengths_lst.append(target_length)
++
++            # Verify that the legacy target is exactly teacher T0.
++            if not torch.equal(tgt_input_ids, tgt_input_ids_lst[0]):
+                 raise ValueError(
+-                    f"Training row {item} contains an empty teacher trace"
++                    f"Training row {item}: target does not equal target_lst[0]"
+                 )
+ 
+-            tgt_lengths_lst.append(target_length)
+-
+-        # Verify that the legacy target is exactly teacher T0.
+-        if not torch.equal(tgt_input_ids, tgt_input_ids_lst[0]):
+-            raise ValueError(
+-                f"Training row {item}: target does not equal target_lst[0]"
++            row_dict["tgt_input_ids_lst"] = tgt_input_ids_lst
++            row_dict["tgt_lengths_lst"] = torch.tensor(
++                tgt_lengths_lst,
++                dtype=torch.long,
+             )
+ 
+-        row_dict["tgt_input_ids_lst"] = tgt_input_ids_lst
+-        row_dict["tgt_lengths_lst"] = torch.tensor(
+-            tgt_lengths_lst,
+-            dtype=torch.long,
+-        )
+-
+-        # Keep the legacy key temporarily so the original execution path
+-        # remains functional while we modify the trainer incrementally.
+-        row_dict["tgt_input_ids"] = tgt_input_ids_lst[0].clone()
++            # Keep the legacy key temporarily so the original execution path
++            # remains functional while we modify the trainer incrementally.
++            row_dict["tgt_input_ids"] = tgt_input_ids_lst[0].clone()
+         """       
+         # process target_list
+         if getattr(self, 'target_list_key', "target_list_key") in row_dict:
+

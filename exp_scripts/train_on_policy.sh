@@ -1,5 +1,5 @@
 set -x
-export HF_ENDPOINT=https://hf-mirror.com
+export HF_ENDPOINT=https://huggingface.co
 
 eval "$(conda shell.bash hook)"
 conda activate luffy

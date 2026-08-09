@@ -50,7 +50,541 @@ from verl.trainer.ppo.ray_trainer import (
     # compute_advantage, 
     reduce_metrics
 )
-from verl.utils.torch_functional import masked_mean
+from verl.utils.torch_functional import masked_mean, get_eos_mask
+
+
+
+
+
+def _select_group_members(
+    student_scores: torch.Tensor,
+    teacher_count: int = 4,
+    group_n: int = 5,
+    success_value: float = 1.0,
+):
+    """Select final group members without constructing trajectory tensors.
+
+    Source tuples:
+        ("student", i): current student candidate i
+        ("teacher", i): stored teacher trajectory i
+    """
+
+    scores = torch.as_tensor(student_scores).detach().cpu()
+
+    if scores.ndim != 2:
+        raise ValueError(
+            f"student_scores must have shape [batch, student_n], "
+            f"got {tuple(scores.shape)}"
+        )
+
+    if not torch.isfinite(scores).all():
+        raise ValueError("student_scores contains NaN or infinity")
+
+    if teacher_count <= 0:
+        raise ValueError(f"teacher_count must be positive, got {teacher_count}")
+
+    if group_n < 2:
+        raise ValueError(f"group_n must be at least 2, got {group_n}")
+
+    plans = []
+
+    for prompt_idx, prompt_scores in enumerate(scores):
+        correct_indices = torch.nonzero(
+            prompt_scores == success_value,
+            as_tuple=False,
+        ).flatten().tolist()
+
+        incorrect_indices = torch.nonzero(
+            prompt_scores != success_value,
+            as_tuple=False,
+        ).flatten().tolist()
+
+        if incorrect_indices:
+            # Reserve one position for a teacher and one for a wrong student.
+            selected_correct = correct_indices[:group_n - 2]
+            selected_wrong = ("student", incorrect_indices[0])
+        else:
+            # All current students are correct. Reserve only one teacher slot.
+            selected_correct = correct_indices[:group_n - 1]
+            selected_wrong = None
+
+        teacher_needed = (
+            group_n
+            - len(selected_correct)
+            - (1 if selected_wrong is not None else 0)
+        )
+
+        if teacher_needed < 1:
+            raise AssertionError("selection failed to reserve one teacher")
+
+        if teacher_needed > teacher_count:
+            raise ValueError(
+                f"Prompt {prompt_idx}: selection requires "
+                f"{teacher_needed} teachers, but only {teacher_count} exist"
+            )
+
+        plan = [
+            ("teacher", teacher_idx)
+            for teacher_idx in range(teacher_needed)
+        ]
+
+        plan.extend(
+            ("student", student_idx)
+            for student_idx in selected_correct
+        )
+
+        if selected_wrong is not None:
+            plan.append(selected_wrong)
+
+        if len(plan) != group_n:
+            raise AssertionError(
+                f"Prompt {prompt_idx}: expected {group_n} members, "
+                f"constructed {len(plan)}"
+            )
+
+        plans.append(plan)
+
+    return plans
+
+
+def _materialize_teacher_rows(
+    prompt_batch: DataProto,
+    metadata_batch: DataProto,
+    teacher_pool: torch.Tensor,
+    teacher_lengths: torch.Tensor,
+    teacher_locations,
+    eos_token_id: int,
+    pad_token_id: int,
+    response_length: int,
+) -> DataProto:
+    """
+    Materialize selected stored teachers as ordinary LUFFY rollout rows.
+
+    teacher_pool:
+        [base_batch_size, teacher_count, stored_target_length]
+
+    teacher_lengths:
+        [base_batch_size, teacher_count]
+
+    teacher_locations:
+        list[(prompt_index, teacher_index)]
+
+    Returns canonical rollout tensors:
+        prompts, responses, input_ids, attention_mask,
+        position_ids, prefix_mask
+    """
+    if not teacher_locations:
+        raise ValueError("teacher_locations must not be empty")
+
+    if teacher_pool.ndim != 3:
+        raise ValueError(
+            f"teacher_pool must have shape [B, T, L], got "
+            f"{tuple(teacher_pool.shape)}"
+        )
+
+    if teacher_lengths.shape != teacher_pool.shape[:2]:
+        raise ValueError(
+            f"teacher_lengths must have shape {tuple(teacher_pool.shape[:2])}, "
+            f"got {tuple(teacher_lengths.shape)}"
+        )
+
+    base_batch_size, teacher_count, stored_length = teacher_pool.shape
+
+    if len(prompt_batch) != base_batch_size:
+        raise ValueError(
+            f"prompt batch has {len(prompt_batch)} rows, "
+            f"teacher pool has {base_batch_size}"
+        )
+
+    if len(metadata_batch) != base_batch_size:
+        raise ValueError(
+            f"metadata batch has {len(metadata_batch)} rows, "
+            f"teacher pool has {base_batch_size}"
+        )
+
+    prompt_indices_list = []
+    teacher_indices_list = []
+
+    for prompt_index, teacher_index in teacher_locations:
+        if not 0 <= prompt_index < base_batch_size:
+            raise IndexError(
+                f"prompt index {prompt_index} outside "
+                f"[0, {base_batch_size})"
+            )
+
+        if not 0 <= teacher_index < teacher_count:
+            raise IndexError(
+                f"teacher index {teacher_index} outside "
+                f"[0, {teacher_count})"
+            )
+
+        prompt_indices_list.append(prompt_index)
+        teacher_indices_list.append(teacher_index)
+
+    prompt_device = prompt_batch.batch["input_ids"].device
+    pool_device = teacher_pool.device
+
+    prompt_indices = torch.tensor(
+        prompt_indices_list,
+        dtype=torch.long,
+        device=prompt_device,
+    )
+
+    pool_prompt_indices = torch.tensor(
+        prompt_indices_list,
+        dtype=torch.long,
+        device=pool_device,
+    )
+
+    pool_teacher_indices = torch.tensor(
+        teacher_indices_list,
+        dtype=torch.long,
+        device=pool_device,
+    )
+
+    prompts = prompt_batch.batch["input_ids"].index_select(
+        0, prompt_indices
+    )
+    prompt_attention_mask = prompt_batch.batch[
+        "attention_mask"
+    ].index_select(0, prompt_indices)
+    prompt_position_ids = prompt_batch.batch[
+        "position_ids"
+    ].index_select(0, prompt_indices)
+
+    selected_teachers = teacher_pool[
+        pool_prompt_indices,
+        pool_teacher_indices,
+    ].to(prompt_device)
+
+    selected_lengths = teacher_lengths[
+        pool_prompt_indices,
+        pool_teacher_indices,
+    ].to(prompt_device, dtype=torch.long)
+
+    if torch.any(selected_lengths <= 0):
+        raise ValueError("every selected teacher must contain at least one token")
+
+    if torch.any(selected_lengths > stored_length):
+        raise ValueError(
+            f"teacher length exceeds stored tensor width {stored_length}"
+        )
+
+    row_count = len(teacher_locations)
+
+    responses = torch.full(
+        (row_count, response_length),
+        fill_value=pad_token_id,
+        dtype=selected_teachers.dtype,
+        device=prompt_device,
+    )
+
+    # Preserve original LUFFY behavior:
+    # teacher content is copied first, then EOS is appended if it fits.
+    for row_index in range(row_count):
+        teacher_length = int(selected_lengths[row_index].item())
+        copied_length = min(teacher_length, response_length)
+
+        responses[row_index, :copied_length] = selected_teachers[
+            row_index, :copied_length
+        ]
+
+        if teacher_length < response_length:
+            responses[row_index, teacher_length] = eos_token_id
+
+    # Original full-prefix LUFFY marks teacher content and its appended EOS
+    # as off-policy tokens.
+    prefix_lengths = torch.clamp(
+        selected_lengths + 1,
+        max=response_length,
+    )
+
+    token_positions = torch.arange(
+        response_length,
+        device=prompt_device,
+    ).unsqueeze(0)
+
+    prefix_mask = token_positions < prefix_lengths.unsqueeze(1)
+
+    response_attention_mask = get_eos_mask(
+        response_id=responses,
+        eos_token=eos_token_id,
+        dtype=prompt_attention_mask.dtype,
+    )
+
+    response_position_offsets = torch.arange(
+        1,
+        response_length + 1,
+        dtype=prompt_position_ids.dtype,
+        device=prompt_device,
+    ).unsqueeze(0)
+
+    response_position_ids = (
+        prompt_position_ids[:, -1:]
+        + response_position_offsets
+    )
+
+    input_ids = torch.cat((prompts, responses), dim=-1)
+    attention_mask = torch.cat(
+        (prompt_attention_mask, response_attention_mask),
+        dim=-1,
+    )
+    position_ids = torch.cat(
+        (prompt_position_ids, response_position_ids),
+        dim=-1,
+    )
+
+    prompt_indices_numpy = np.asarray(
+        prompt_indices_list,
+        dtype=np.int64,
+    )
+
+    non_tensor_batch = {
+        key: value[prompt_indices_numpy]
+        for key, value in metadata_batch.non_tensor_batch.items()
+    }
+
+    return DataProto.from_dict(
+        tensors={
+            "prompts": prompts,
+            "responses": responses,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "prefix_mask": prefix_mask,
+        },
+        non_tensors=non_tensor_batch,
+        meta_info=prompt_batch.meta_info,
+    )
+
+
+
+
+
+def _assemble_final_groups(
+    student_batch: DataProto,
+    student_rewards: torch.Tensor,
+    teacher_batch: DataProto,
+    teacher_rewards: torch.Tensor,
+    plans,
+    teacher_locations,
+    student_n: int,
+    group_n: int,
+):
+    """
+    Assemble final contiguous GRPO groups from selected student/teacher rows.
+
+    Student rows are ordered as:
+        prompt 0: S0 ... S(student_n - 1)
+        prompt 1: S0 ... S(student_n - 1)
+        ...
+
+    Teacher rows must be ordered exactly like teacher_locations.
+
+    Returns:
+        final_batch:   DataProto with shape [B * group_n, ...]
+        final_rewards: tensor with shape [B * group_n, response_length]
+    """
+    base_batch_size = len(plans)
+    expected_student_rows = base_batch_size * student_n
+
+    if student_n <= 0:
+        raise ValueError(f"student_n must be positive, got {student_n}")
+
+    if group_n <= 0:
+        raise ValueError(f"group_n must be positive, got {group_n}")
+
+    if len(student_batch) != expected_student_rows:
+        raise ValueError(
+            f"expected {expected_student_rows} student rows, "
+            f"got {len(student_batch)}"
+        )
+
+    if student_rewards.ndim != 2:
+        raise ValueError(
+            f"student_rewards must have shape [B * student_n, R], "
+            f"got {tuple(student_rewards.shape)}"
+        )
+
+    if student_rewards.shape[0] != len(student_batch):
+        raise ValueError(
+            f"student reward rows {student_rewards.shape[0]} do not match "
+            f"student batch rows {len(student_batch)}"
+        )
+
+    if len(teacher_batch) != len(teacher_locations):
+        raise ValueError(
+            f"teacher batch contains {len(teacher_batch)} rows but "
+            f"teacher_locations contains {len(teacher_locations)} entries"
+        )
+
+    if teacher_rewards.ndim != 2:
+        raise ValueError(
+            f"teacher_rewards must have shape [teacher_rows, R], "
+            f"got {tuple(teacher_rewards.shape)}"
+        )
+
+    if teacher_rewards.shape[0] != len(teacher_batch):
+        raise ValueError(
+            f"teacher reward rows {teacher_rewards.shape[0]} do not match "
+            f"teacher batch rows {len(teacher_batch)}"
+        )
+
+    if student_rewards.shape[1] != teacher_rewards.shape[1]:
+        raise ValueError(
+            f"student and teacher reward lengths differ: "
+            f"{student_rewards.shape[1]} versus "
+            f"{teacher_rewards.shape[1]}"
+        )
+
+    student_tensor_keys = set(student_batch.batch.keys())
+    teacher_tensor_keys = set(teacher_batch.batch.keys())
+
+    if student_tensor_keys != teacher_tensor_keys:
+        raise ValueError(
+            "student and teacher tensor keys differ: "
+            f"student-only={sorted(student_tensor_keys - teacher_tensor_keys)}, "
+            f"teacher-only={sorted(teacher_tensor_keys - student_tensor_keys)}"
+        )
+
+    student_non_tensor_keys = set(student_batch.non_tensor_batch.keys())
+    teacher_non_tensor_keys = set(teacher_batch.non_tensor_batch.keys())
+
+    if student_non_tensor_keys != teacher_non_tensor_keys:
+        raise ValueError(
+            "student and teacher non-tensor keys differ: "
+            f"student-only="
+            f"{sorted(student_non_tensor_keys - teacher_non_tensor_keys)}, "
+            f"teacher-only="
+            f"{sorted(teacher_non_tensor_keys - student_non_tensor_keys)}"
+        )
+
+    if len(set(teacher_locations)) != len(teacher_locations):
+        raise ValueError(
+            "teacher_locations contains duplicate prompt/teacher pairs"
+        )
+
+    combined_batch = DataProto.concat([
+        student_batch,
+        teacher_batch,
+    ])
+
+    combined_rewards = torch.cat(
+        (
+            student_rewards,
+            teacher_rewards.to(student_rewards.device),
+        ),
+        dim=0,
+    )
+
+    teacher_row_by_location = {
+        location: expected_student_rows + row_index
+        for row_index, location in enumerate(teacher_locations)
+    }
+
+    final_indices = []
+
+    for prompt_index, plan in enumerate(plans):
+        if len(plan) != group_n:
+            raise ValueError(
+                f"prompt {prompt_index} has a plan with {len(plan)} rows; "
+                f"expected group_n={group_n}"
+            )
+
+        for source, source_index in plan:
+            if source == "student":
+                if not 0 <= source_index < student_n:
+                    raise IndexError(
+                        f"student index {source_index} outside "
+                        f"[0, {student_n})"
+                    )
+
+                final_indices.append(
+                    prompt_index * student_n + source_index
+                )
+
+            elif source == "teacher":
+                location = (prompt_index, source_index)
+
+                if location not in teacher_row_by_location:
+                    raise KeyError(
+                        f"teacher {location} appears in the selection plan "
+                        f"but was not materialized"
+                    )
+
+                final_indices.append(
+                    teacher_row_by_location[location]
+                )
+
+            else:
+                raise ValueError(
+                    f"unknown group-member source {source!r}; "
+                    f"expected 'student' or 'teacher'"
+                )
+
+    expected_final_rows = base_batch_size * group_n
+
+    if len(final_indices) != expected_final_rows:
+        raise RuntimeError(
+            f"assembled {len(final_indices)} indices; "
+            f"expected {expected_final_rows}"
+        )
+
+    final_indices_cpu = torch.tensor(
+        final_indices,
+        dtype=torch.long,
+    )
+
+    final_tensors = {
+        key: tensor.index_select(
+            0,
+            final_indices_cpu.to(tensor.device),
+        )
+        for key, tensor in combined_batch.batch.items()
+    }
+
+    final_indices_numpy = np.asarray(
+        final_indices,
+        dtype=np.int64,
+    )
+
+    final_non_tensors = {
+        key: values[final_indices_numpy]
+        for key, values in combined_batch.non_tensor_batch.items()
+    }
+
+    final_batch = DataProto.from_dict(
+        tensors=final_tensors,
+        non_tensors=final_non_tensors,
+        meta_info=student_batch.meta_info,
+    )
+
+    final_rewards = combined_rewards.index_select(
+        0,
+        final_indices_cpu.to(combined_rewards.device),
+    )
+
+    # GRPO uses UID, not row adjacency alone, to identify each group.
+    if "uid" not in final_batch.non_tensor_batch:
+        raise KeyError("final batch has no 'uid' field")
+
+    final_uids = final_batch.non_tensor_batch["uid"]
+
+    for prompt_index in range(base_batch_size):
+        group_start = prompt_index * group_n
+        group_end = group_start + group_n
+        group_uids = final_uids[group_start:group_end]
+
+        if not np.all(group_uids == group_uids[0]):
+            raise ValueError(
+                f"assembled group {prompt_index} contains multiple UIDs: "
+                f"{group_uids.tolist()}"
+            )
+
+    return final_batch, final_rewards
+
+
+
 
 
 # directly copied from verl/trainer/ppo/ray_trainer.py
@@ -302,7 +836,19 @@ class MIXRayPPOTrainer(RayPPOTrainer):
                                          truncation='error',
                                          max_target_length=self.config.actor_rollout_ref.rollout.max_prefix_len,
                                          filter_targets=self.config.data.get('filter_targets', False),
-                                         sample_target_ratio=self.config.data.get('sample_target_ratio', 1.0))
+                                         sample_target_ratio=self.config.data.get('sample_target_ratio', 1.0),
+                                         target_list_key=self.config.data.get(
+                                             'teacher_pool_key',
+                                             'target_lst',
+                                         ),
+                                         max_num_targets=self.config.data.get(
+                                             'teacher_pool_size',
+                                             4,
+                                         ),
+                                         use_teacher_pool=self.config.algorithm.get(
+                                             'grade_before_grouping',
+                                             True,
+                                         ))
 
         # use sampler for better ckpt resume
         if self.config.data.shuffle:
@@ -380,9 +926,48 @@ class MIXRayPPOTrainer(RayPPOTrainer):
         # we start from step 1
         self.global_steps += 1
 
-        n_samples = self.config.actor_rollout_ref.rollout.n
-        if self.config.data.get('add_tgt_with_acc', False):
-            n_samples = n_samples - 1 # if filter tgt with acc, we either use tgt or on policy samples.
+        #n_samples = self.config.actor_rollout_ref.rollout.n
+        #if self.config.data.get('add_tgt_with_acc', False):
+        #    n_samples = n_samples - 1 # if filter tgt with acc, we either use tgt or on policy samples.
+        grade_before_grouping = bool(
+            self.config.algorithm.get(
+                "grade_before_grouping",
+                True,
+            )
+        )
+        student_n = int(self.config.actor_rollout_ref.rollout.n)
+        group_n = int(
+            self.config.actor_rollout_ref.rollout.get(
+                "group_n",
+                student_n,
+            )
+        )
+
+        if student_n <= 0:
+            raise ValueError(
+                f"rollout.n must be positive, got {student_n}"
+            )
+
+        if group_n <= 0:
+            raise ValueError(
+                f"rollout.group_n must be positive, got {group_n}"
+            )
+
+        if not grade_before_grouping and group_n != student_n:
+            raise ValueError(
+                "Original LUFFY requires rollout.group_n == rollout.n; "
+                f"got group_n={group_n}, n={student_n}"
+            )
+
+        # Retained for the existing optional SFT-prefix code below.
+        n_samples = group_n
+        if self.config.data.get("add_tgt_with_acc", False):
+            n_samples -= 1
+
+
+
+
+
 
         for _ in range(self.config.trainer.total_epochs):
             
@@ -391,8 +976,12 @@ class MIXRayPPOTrainer(RayPPOTrainer):
 
                 metrics = {}
                 timing_raw = {}
+                metrics["batch/grade_before_grouping"] = float(
+                    grade_before_grouping
+                )
 
                 # pop those keys for generation
+                """
                 gen_batch = batch.pop(batch_keys=['input_ids', 'attention_mask', 'position_ids', 'tgt_input_ids'])
                 gen_batch.meta_info['global_steps'] = self.global_steps
 
@@ -428,7 +1017,286 @@ class MIXRayPPOTrainer(RayPPOTrainer):
                         reward_tensor = self.reward_fn(batch) # [bsz, l], only the last valid token has reward
 
                         batch.batch['token_level_scores'] = reward_tensor
-                        
+                """ 
+                                # Keep generation inputs, teacher storage and metadata separate.
+                #
+                # prompt_batch:
+                #     [B] prompt tensors used by vLLM and teacher materialization
+                #
+                # teacher_pool_batch:
+                #     [B, 4, L] stored teachers; never sent to vLLM
+                #
+                # batch:
+                #     [B] non-tensor metadata, later repeated/reindexed
+                prompt_batch = batch.pop(
+                    batch_keys=[
+                        "input_ids",
+                        "attention_mask",
+                        "position_ids",
+                    ]
+                )
+
+                base_batch_size = len(batch)
+
+                if len(prompt_batch) != base_batch_size:
+                    raise ValueError(
+                        f"prompt batch has {len(prompt_batch)} rows but "
+                        f"metadata batch has {base_batch_size}"
+                    )
+
+                if grade_before_grouping:
+                    teacher_pool_batch = batch.pop(
+                        batch_keys=[
+                            "tgt_input_ids",
+                            "tgt_input_ids_lst",
+                            "tgt_lengths_lst",
+                        ]
+                    )
+                    teacher_pool = teacher_pool_batch.batch[
+                        "tgt_input_ids_lst"
+                    ]
+                    teacher_lengths = teacher_pool_batch.batch[
+                        "tgt_lengths_lst"
+                    ]
+
+                    if teacher_pool.shape[0] != base_batch_size:
+                        raise ValueError(
+                            f"teacher pool has {teacher_pool.shape[0]} prompts "
+                            f"but batch has {base_batch_size}"
+                        )
+
+                    configured_teacher_count = int(
+                        self.config.data.get("teacher_pool_size", 4)
+                    )
+                    actual_teacher_count = int(teacher_pool.shape[1])
+
+                    if actual_teacher_count != configured_teacher_count:
+                        raise ValueError(
+                            f"configured teacher_pool_size="
+                            f"{configured_teacher_count}, but dataset returned "
+                            f"{actual_teacher_count} teachers per prompt"
+                        )
+
+                    # Prompt-only input: vLLM generates student trajectories.
+                    gen_batch = prompt_batch
+                else:
+                    # Exact original LUFFY input: vLLM receives T0 through
+                    # tgt_input_ids and creates the mixed prefix/student group.
+                    legacy_target_batch = batch.pop(
+                        batch_keys=["tgt_input_ids"]
+                    )
+                    gen_batch = prompt_batch.union(legacy_target_batch)
+
+                gen_batch.meta_info["global_steps"] = self.global_steps
+
+                with _timer("step", timing_raw):
+                    with _timer("gen", timing_raw):
+                        student_output = (
+                            self.actor_rollout_wg.generate_sequences(
+                                gen_batch
+                            )
+                        )
+
+                    expected_student_rows = (
+                        base_batch_size * student_n
+                    )
+
+                    if len(student_output) != expected_student_rows:
+                        raise ValueError(
+                            f"vLLM returned {len(student_output)} rows; "
+                            f"expected {base_batch_size} prompts * "
+                            f"{student_n} students = "
+                            f"{expected_student_rows}"
+                        )
+
+                    # One UID per original prompt. Repeating with interleave=True
+                    # gives the same UID to S0...S(student_n-1).
+                    batch.non_tensor_batch["uid"] = np.array(
+                        [
+                            str(uuid.uuid4())
+                            for _ in range(base_batch_size)
+                        ],
+                        dtype=object,
+                    )
+
+                    student_metadata = batch.repeat(
+                        repeat_times=student_n,
+                        interleave=True,
+                    )
+
+                    student_batch = student_metadata.union(
+                        student_output
+                    )
+
+                    if "prefix_ratios" in student_output.meta_info:
+                        metrics["batch/avg_prefix_ratio"] = float(
+                            np.mean(student_output.meta_info["prefix_ratios"])
+                        )
+
+                    if grade_before_grouping:
+                        # Prompt-only vLLM generation does not create prefix_mask.
+                        # Every student response is fully on-policy.
+                        student_batch.batch["prefix_mask"] = torch.zeros_like(
+                            student_batch.batch["responses"],
+                            dtype=torch.bool,
+                        )
+
+                        # Grade all four current-policy students exactly once.
+                        with _timer("student_reward", timing_raw):
+                            if self.use_rm:
+                                student_rm_scores = (
+                                    self.rm_wg.compute_rm_score(
+                                        student_batch
+                                    )
+                                )
+                                student_batch = student_batch.union(
+                                    student_rm_scores
+                                )
+
+                            student_rewards = self.reward_fn(
+                                student_batch
+                            )
+
+                        if student_rewards.shape != (
+                            expected_student_rows,
+                            student_batch.batch["responses"].shape[-1],
+                        ):
+                            raise ValueError(
+                                f"student reward shape "
+                                f"{tuple(student_rewards.shape)} does not match "
+                                f"expected "
+                                f"({expected_student_rows}, "
+                                f"{student_batch.batch['responses'].shape[-1]})"
+                            )
+
+                        student_scores = student_rewards.sum(
+                            dim=-1
+                        ).reshape(
+                            base_batch_size,
+                            student_n,
+                        )
+
+                        plans = _select_group_members(
+                            student_scores=student_scores,
+                            teacher_count=actual_teacher_count,
+                            group_n=group_n,
+                        )
+
+                        # Materialize only teachers that appear in a final plan.
+                        # The order here must be preserved when teacher_batch is
+                        # passed to _assemble_final_groups.
+                        teacher_locations = [
+                            (prompt_index, member_index)
+                            for prompt_index, plan in enumerate(plans)
+                            for source, member_index in plan
+                            if source == "teacher"
+                        ]
+
+                        with _timer(
+                            "teacher_materialization",
+                            timing_raw,
+                        ):
+                            teacher_batch = _materialize_teacher_rows(
+                                prompt_batch=prompt_batch,
+                                metadata_batch=batch,
+                                teacher_pool=teacher_pool,
+                                teacher_lengths=teacher_lengths,
+                                teacher_locations=teacher_locations,
+                                eos_token_id=self.tokenizer.eos_token_id,
+                                pad_token_id=self.tokenizer.pad_token_id,
+                                response_length=student_batch.batch[
+                                    "responses"
+                                ].shape[-1],
+                            )
+
+                        # Grade selected teachers with the same verifier used for
+                        # students. We do not assume teacher reward == 1.
+                        with _timer("teacher_reward", timing_raw):
+                            if self.use_rm:
+                                teacher_rm_scores = (
+                                    self.rm_wg.compute_rm_score(
+                                        teacher_batch
+                                    )
+                                )
+                                teacher_batch = teacher_batch.union(
+                                    teacher_rm_scores
+                                )
+
+                            teacher_rewards = self.reward_fn(
+                                teacher_batch
+                            )
+
+                        batch, reward_tensor = _assemble_final_groups(
+                            student_batch=student_batch,
+                            student_rewards=student_rewards,
+                            teacher_batch=teacher_batch,
+                            teacher_rewards=teacher_rewards,
+                            plans=plans,
+                            teacher_locations=teacher_locations,
+                            student_n=student_n,
+                            group_n=group_n,
+                        )
+
+                        expected_final_rows = (
+                            base_batch_size * group_n
+                        )
+
+                        if len(batch) != expected_final_rows:
+                            raise RuntimeError(
+                                f"assembled batch has {len(batch)} rows; "
+                                f"expected {expected_final_rows}"
+                            )
+
+                        metrics["batch/generated_students"] = (
+                            expected_student_rows
+                        )
+                        metrics["batch/selected_students"] = (
+                            expected_final_rows
+                            - len(teacher_locations)
+                        )
+                        metrics["batch/selected_teachers"] = len(
+                            teacher_locations
+                        )
+                        metrics["batch/teacher_fraction"] = (
+                            len(teacher_locations)
+                            / expected_final_rows
+                        )
+                        metrics["batch/student_success_rate"] = (
+                            student_scores.eq(1).float().mean().item()
+                        )
+                    else:
+                        # vLLM already returned the complete original LUFFY
+                        # group: one T0-prefixed row and n-1 student rows.
+                        # Keep its ordering and prefix_mask exactly unchanged.
+                        batch = student_batch
+                        reward_tensor = None
+
+                    # In either mode values are computed only on the final
+                    # group that will be used for the PPO/GRPO update.
+                    if self.use_critic:
+                        with _timer("values", timing_raw):
+                            values = self.critic_wg.compute_values(
+                                batch
+                            )
+                            batch = batch.union(values)
+
+                    with _timer("adv", timing_raw):
+                        if not grade_before_grouping:
+                            # Preserve original LUFFY order: form the mixed
+                            # group first, compute values, then grade it once.
+                            if self.use_rm:
+                                rm_scores = self.rm_wg.compute_rm_score(batch)
+                                batch = batch.union(rm_scores)
+
+                            reward_tensor = self.reward_fn(batch)
+
+                        batch.batch["token_level_scores"] = (
+                            reward_tensor
+                        )
+
+
+
+
                         # Rejection sampling based on rewards
                         # Group rewards by uid
                         uids = batch.non_tensor_batch['uid']
