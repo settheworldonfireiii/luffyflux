@@ -1390,7 +1390,7 @@ class MIXRayPPOTrainer(RayPPOTrainer):
 
 
                         # recompute old_log_probs
-                        if not use_reval:
+                        if not self.se_reval:
                             with _timer('old_log_prob', timing_raw):
                                 old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                                 batch = batch.union(old_log_prob)
@@ -1443,14 +1443,14 @@ class MIXRayPPOTrainer(RayPPOTrainer):
                                 truncated_mask = has_truncated & no_eos
                                 batch.batch['advantages'][truncated_mask] = 0
                         else:
-                             with _timer("ref", timing_raw):
+                            with _timer("ref", timing_raw):
                                 ref_terms = self.ref_policy_wg.compute_ref_log_prob(batch)
                                 batch = batch.union(ref_terms)
 
                             batch.batch["token_level_rewards"] = (
                                 batch.batch["token_level_scores"]
                             )
-                        if self.config.actor_rollout_ref.actor.get('use_sft_prefix_reward', False):
+                        if not use_reval and self.config.actor_rollout_ref.actor.get('use_sft_prefix_reward', False):
                             assert self.config.actor_rollout_ref.rollout.n_prefix == -1
                             reward_weight = self.config.actor_rollout_ref.actor.get('sft_prefix_reward_weight', 1.0)
                             batch.batch['advantages'][prefix_mask] = reward_weight / n_samples
@@ -1497,7 +1497,7 @@ class MIXRayPPOTrainer(RayPPOTrainer):
                             self._save_checkpoint()
 
                 # collect metrics
-                if not use_reval:
+                if not self.use_reval:
                     metrics.update(compute_data_metrics_ours(batch=batch, use_critic=self.use_critic))
                 else:
                     metrics["reval/reward_mean"] = (

@@ -127,24 +127,25 @@ class MIXDataParallelPPOActor(DataParallelPPOActor):
                     response_length = responses.size(1)
                     attention_mask = data['attention_mask']
                     response_mask = attention_mask[:, -response_length:]
-                    old_log_prob = data['old_log_probs']
-                    advantages = data['advantages']
 
                     clip_ratio = self.config.clip_ratio
                     entropy_coeff = self.config.entropy_coeff
                     if not use_reval:
                         entropy, log_prob = self._forward_micro_batch(micro_batch=data, temperature=temperature)
-                    else:
+                        old_log_prob = data['old_log_probs']
+                        advantages = data['advantages']
+                    elif use_reval:
                         entropy, log_prob, v_theta = self._forward_micro_batch(
                         micro_batch=data,
                         temperature=temperature,
                         compute_reval=True,
                         )
+                    if use_reval:
                         pg_loss = self._compute_reval_actor_loss(data=data,v_theta=v_theta,token_log_probs=log_prob, beta=reval_beta)
                         pg_clipfrac = pg_loss.detach().new_zeros(())
                         ppo_kl = pg_loss.detach().new_zeros(())
 
-                    if self.config.use_sft_multitask_loss:
+                    elif self.config.use_sft_multitask_loss:
                         assert self.config.use_off_policy_loss is False, 'Either use off-policy loss or sft multitask loss. You cannot set both to be True.'
                         from .mix_core_alg import compute_sft_pure_loss
                         off_policy_mask = data['prefix_mask'].any(-1) # [No]
@@ -278,17 +279,17 @@ class MIXDataParallelPPOActor(DataParallelPPOActor):
                     loss = policy_loss / self.gradient_accumulation
                     loss.backward()
 
-                    metric_data = {
+                    data = {
                         'actor/entropy_loss': entropy_loss.detach().item(),
                         'actor/pg_loss': pg_loss.detach().item(),
                         'actor/pg_clipfrac': pg_clipfrac.detach().item(),
                         'actor/ppo_kl': ppo_kl.detach().item(),
                     }
-                    append_to_dict(metrics, metric_data)
+                    append_to_dict(metrics, data)
 
                 grad_norm = self._optimizer_step()
-                metric_data = {'actor/grad_norm': grad_norm.detach().item()}
-                append_to_dict(metrics, metric_data)
+                data = {'actor/grad_norm': grad_norm.detach().item()}
+                append_to_dict(metrics, data)
         self.actor_optimizer.zero_grad()
         if self.alpha_optimizer is not None:
             self.alpha_optimizer.zero_grad()

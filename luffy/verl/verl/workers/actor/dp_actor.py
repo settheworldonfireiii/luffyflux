@@ -34,7 +34,7 @@ import verl.utils.torch_functional as verl_F
 from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
 
 
-from .mix_core_alg import reval_initial_state_value, reval_trajectory_log_prob
+#from .mix_core_alg import reval_initial_state_value, reval_trajectory_log_prob
 
 __all__ = ['DataParallelPPOActor']
 
@@ -233,7 +233,7 @@ class DataParallelPPOActor(BasePPOActor):
             with torch.no_grad():
                 if compute_reval:
                      _, log_probs, value = self._forward_micro_batch(micro_batch,temperature=temperature,compute_entropy=False,compute_reval=True)
-            values_lst.append(value)
+                    values_lst.append(value)
                 else:
                     _, log_probs = self._forward_micro_batch(micro_batch, temperature=temperature, compute_entropy=False)
             log_probs_lst.append(log_probs)

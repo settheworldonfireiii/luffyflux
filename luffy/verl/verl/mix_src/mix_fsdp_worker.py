@@ -116,7 +116,7 @@ class MIXActorRolloutRefWorker(Worker):
 
 
     def _compute_reval_ref(self, data):
-        v_ref, log_pi_ref = self.ref_policy.compute_reval_terms(data)
+        v_ref, log_pi_ref = self.ref_policy.compute_reval_terms(data, compute_reval = True)
         return DataProto.from_dict(
             tensors={"v_ref": v_ref.detach(), "log_pi_ref": log_pi_ref.detach()}
         )
@@ -513,7 +513,7 @@ class MIXActorRolloutRefWorker(Worker):
             data = self.ulysses_sharding_manager.preprocess_data(data)
             function = (
                 self._compute_reval_ref
-                if data.meta_info.get("ref_mode") == "reval"
+                if data.meta_info.get("use_reval", False)
                 else self._compute_luffy_ref
             )
             output = self.ulysses_sharding_manager.postprocess_data(function(data))
@@ -562,7 +562,7 @@ class MIXActorRolloutRefWorker(Worker):
                 )
 
             data = data.to("cuda")
-
+            use_reval = data.meta_info.get("use_reval", False)
             # We should always recompute old_log_probs in HybridEngine.
             data.meta_info["micro_batch_size"] = (
                 self.config.rollout.log_prob_micro_batch_size
@@ -573,13 +573,14 @@ class MIXActorRolloutRefWorker(Worker):
             data.meta_info["use_dynamic_bsz"] = (
                 self.config.rollout.log_prob_use_dynamic_bsz
             )
-            data.meta_info["temperature"] = self.config.rollout.temperature
+            data.meta_info["temperature"] = (1.0 if use_reval else self.config.rollout.temperature)
 
             with self.ulysses_sharding_manager:
                 data = self.ulysses_sharding_manager.preprocess_data(data)
                 old_log_probs = self.actor.compute_log_prob(data=data)
                 data.batch["old_log_probs"] = old_log_probs
-                data = self.ulysses_sharding_manager.postprocess_data(data)
+                function = (self._compute_reval_ref if use_reval else self._compute_luffy_ref)
+                data = self.ulysses_sharding_manager.postprocess_data(function(data))
 
             output = data.select(batch_keys=["old_log_probs"])
             output = output.to("cpu")
