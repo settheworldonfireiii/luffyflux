@@ -4,6 +4,25 @@ from collections import defaultdict
 
 import verl.utils.torch_functional as verl_F
 
+
+def reval_initial_state_value(logits, response_length):
+    value = torch.logsumexp(logits[..., -response_length - 1, :].float(), dim=-1)
+    return value
+
+
+
+
+def reval_trajectory_log_prob(logits, responses, response_mask):
+    response_length = responses.size(-1)
+    token_logits = logits[..., -response_length - 1:-1, :].float()
+    chosen_logits = torch.gather(token_logits, -1, responses.unsqueeze(-1)).squeeze(-1)
+    token_log_probs = chosen_logits - torch.logsumexp(token_logits, dim=-1)
+    return (token_log_probs * response_mask).sum(dim=-1)
+
+
+
+
+
 def compute_sft_pure_loss(log_prob, eos_mask):
     sft_losses = -log_prob
     sft_loss = verl_F.masked_mean(sft_losses, eos_mask)
@@ -65,6 +84,37 @@ def compute_grpo_outcome_advantage_split(token_level_rewards: torch.Tensor,
         scores = scores.unsqueeze(-1).tile([1, response_length]) * eos_mask
 
     return scores, scores
+
+
+
+def compute_reval_loss(v_theta, v_ref, log_pi_theta, log_pi_ref, rewards, beta):
+    residual = v_theta - v_ref + log_pi_theta - log_pi_ref - rewards / beta
+    return residual.square().mean()
+
+
+def compute_reval_loss_models_in(model_ref, model_theta, logits_theta, logits_ref, trajectory, attention_mask, rewards, beta):
+    with torch.no_grad():
+        logits_ref = model_ref(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=False).logits
+
+        logits_theta = model_theta(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=False).logits
+
+    response_length = trajectory.size(-1)
+    response_mask = attention_mask[..., -response_length:]
+    v_theta = reval_initial_state_value(logits_theta, response_length)
+    v_ref = reval_initial_state_value(logits_ref, response_length).detach()
+    log_pi_theta = reval_trajectory_log_prob(logits_theta, trajectory, response_mask)
+    log_pi_ref = reval_trajectory_log_prob(logits_ref, trajectory, response_mask).detach()
+    rewards = (rewards * response_mask).sum(-1) if rewards.ndim == trajectory.ndim else rewards
+    residual = v_theta - v_ref + log_pi_theta - rewards / beta - log_pi_ref
+    return residual.square().mean()
 
 def compute_token_on_off_policy_loss(
     old_log_prob, 

@@ -109,7 +109,17 @@ class MIXActorRolloutRefWorker(Worker):
             self.config.ref.log_prob_micro_batch_size //= (self.device_mesh.shape[0] //
                                                            self.ulysses_sequence_parallel_size)
             self.config.ref.log_prob_micro_batch_size *= group_n
+    # Dans MIXActorRolloutRefWorker
+    def _compute_luffy_ref(self, data):
+        log_prob = self.ref_policy.compute_log_prob(data)
+        return DataProto.from_dict(tensors={"ref_log_prob": log_prob})
 
+
+    def _compute_reval_ref(self, data):
+        v_ref, log_pi_ref = self.ref_policy.compute_reval_terms(data)
+        return DataProto.from_dict(
+            tensors={"v_ref": v_ref.detach(), "log_pi_ref": log_pi_ref.detach()}
+        )
     def _build_model_optimizer(self,
                                model_path,
                                fsdp_config,
@@ -487,7 +497,26 @@ class MIXActorRolloutRefWorker(Worker):
             )
         torch.cuda.empty_cache()
         return output
-        
+        @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+        def compute_ref_log_prob(self, data):
+            data = data.to("cuda")
+            data.meta_info.update(
+                micro_batch_size=self.config.ref.log_prob_micro_batch_size,
+                temperature=self.config.rollout.temperature,
+                max_token_len=self.config.ref.log_prob_max_token_len_per_gpu,
+                use_dynamic_bsz=self.config.ref.log_prob_use_dynamic_bsz,
+            )
+
+            with self.ulysses_sharding_manager:
+                data = self.ulysses_sharding_manager.preprocess_data(data)
+                function = (
+                    self._compute_reval_ref
+                    if data.meta_info.get("ref_mode") == "reval"
+                    else self._compute_luffy_ref
+                )
+                output = self.ulysses_sharding_manager.postprocess_data(function(data))
+
+            return output.to("cpu") 
         
         """
         @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)

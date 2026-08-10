@@ -85,7 +85,7 @@ class RLHFDatasetWithTarget(RLHFDataset):
                  sample_target_ratio=1.0,
                  target_list_key='target_lst',
                  max_num_targets=4,
-                 use_teacher_pool=True,
+                 use_teacher_pool=False,
                  target_probs_key='target_ds_qwen_7b_probs',
         ):
         super().__init__(parquet_files, tokenizer, prompt_key, max_prompt_length, filter_prompts, cache_dir, chat_template_func, return_raw_chat, truncation)

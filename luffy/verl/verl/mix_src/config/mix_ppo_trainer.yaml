@@ -201,7 +201,7 @@ reward_model:
 algorithm:
   # False: original LUFFY (one pre-saved T0 prefix + n-1 students).
   # True: grade students first, then assemble a group_n-sized group.
-  grade_before_grouping: True
+  grade_before_grouping: False
   gamma: 1.0
   lam: 1.0
   adv_estimator: gae

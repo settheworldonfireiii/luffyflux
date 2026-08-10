@@ -30,6 +30,10 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.seqlen_balancing import rearrange_micro_batches
 import verl.utils.torch_functional as verl_F
 
+
+from verl.mix_src.mix_core_alg import compute_reval_loss
+
+
 __all__ = ['MIXDataParallelPPOActor']
 
 from verl.workers.actor.dp_actor import DataParallelPPOActor
@@ -270,3 +274,14 @@ class MIXDataParallelPPOActor(DataParallelPPOActor):
         if self.alpha_optimizer is not None:
             self.alpha_optimizer.step()
         return grad_norm
+    
+    
+    def _compute_reval_actor_loss(self, data, v_theta, token_log_probs, beta):
+        responses = data["responses"]
+        response_mask = data["attention_mask"][..., -responses.size(-1):]
+        log_pi_theta = (token_log_probs * response_mask).sum(-1)
+        rewards = (data["token_level_scores"] * response_mask).sum(-1)
+        return compute_reval_loss(
+            v_theta, data["v_ref"], log_pi_theta,
+            data["log_pi_ref"], rewards, beta,
+        )

@@ -143,7 +143,26 @@ class DataParallelPPOActor(BasePPOActor):
                     else None
                     )
             return entropy, log_probs
-
+    
+    
+    # Dans DataParallelPPOActor
+    def compute_reval_terms(self, data):
+        values, log_probs = [], []
+        for batch in data.batch.split(data.meta_info["micro_batch_size"]):
+            with torch.no_grad():
+                logits = self.actor_module(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    position_ids=batch["position_ids"],
+                    use_cache=False,
+                ).logits
+            mask = batch["attention_mask"][..., -batch["responses"].size(-1):]
+            values.append(reval_initial_state_value(logits, batch["responses"].size(-1)))
+            log_probs.append(reval_trajectory_log_prob(logits, batch["responses"], mask))
+        return torch.cat(values), torch.cat(log_probs)
+    
+    
+    
     def _optimizer_step(self):
         assert self.config.grad_clip is not None
 

@@ -847,7 +847,7 @@ class MIXRayPPOTrainer(RayPPOTrainer):
                                          ),
                                          use_teacher_pool=self.config.algorithm.get(
                                              'grade_before_grouping',
-                                             True,
+                                             False,
                                          ))
 
         # use sampler for better ckpt resume
@@ -932,7 +932,7 @@ class MIXRayPPOTrainer(RayPPOTrainer):
         grade_before_grouping = bool(
             self.config.algorithm.get(
                 "grade_before_grouping",
-                True,
+                False,
             )
         )
         student_n = int(self.config.actor_rollout_ref.rollout.n)

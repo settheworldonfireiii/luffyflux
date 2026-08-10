@@ -1,0 +1,48 @@
+diff --git a/luffy/verl/verl/mix_src/config/mix_ppo_trainer.yaml b/luffy/verl/verl/mix_src/config/mix_ppo_trainer.yaml
+index 39d2c14..d7240dc 100644
+--- a/luffy/verl/verl/mix_src/config/mix_ppo_trainer.yaml
++++ b/luffy/verl/verl/mix_src/config/mix_ppo_trainer.yaml
+@@ -201,6 +201,6 @@ algorithm:
+   # False: original LUFFY (one pre-saved T0 prefix + n-1 students).
+   # True: grade students first, then assemble a group_n-sized group.
+-  grade_before_grouping: True
++  grade_before_grouping: False
+   gamma: 1.0
+   lam: 1.0
+   adv_estimator: gae
+diff --git a/luffy/verl/verl/mix_src/mix_trainer.py b/luffy/verl/verl/mix_src/mix_trainer.py
+index 5a65a2c..98a9a4d 100644
+--- a/luffy/verl/verl/mix_src/mix_trainer.py
++++ b/luffy/verl/verl/mix_src/mix_trainer.py
+@@ -847,7 +847,7 @@ class MIXRayPPOTrainer(RayPPOTrainer):
+                                          ),
+                                          use_teacher_pool=self.config.algorithm.get(
+                                              'grade_before_grouping',
+-                                             True,
++                                             False,
+                                          ))
+ 
+         # use sampler for better ckpt resume
+@@ -932,7 +932,7 @@ class MIXRayPPOTrainer(RayPPOTrainer):
+         grade_before_grouping = bool(
+             self.config.algorithm.get(
+                 "grade_before_grouping",
+-                True,
++                False,
+             )
+         )
+         student_n = int(self.config.actor_rollout_ref.rollout.n)
+diff --git a/luffy/verl/verl/mix_src/rl_dataset_with_target.py b/luffy/verl/verl/mix_src/rl_dataset_with_target.py
+index 6148fd0..4252e20 100644
+--- a/luffy/verl/verl/mix_src/rl_dataset_with_target.py
++++ b/luffy/verl/verl/mix_src/rl_dataset_with_target.py
+@@ -85,7 +85,7 @@ class RLHFDatasetWithTarget(RLHFDataset):
+                  sample_target_ratio=1.0,
+                  target_list_key='target_lst',
+                  max_num_targets=4,
+-                 use_teacher_pool=True,
++                 use_teacher_pool=False,
+                  target_probs_key='target_ds_qwen_7b_probs',
+         ):
+         super().__init__(parquet_files, tokenizer, prompt_key, max_prompt_length, filter_prompts, cache_dir, chat_template_func, return_raw_chat, truncation)
+
