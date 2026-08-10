@@ -211,6 +211,8 @@ algorithm:
     kl_coef: 0.001
   grpo_use_std: True
   surprisal_base: 0.0
+  use_reval: False
+  reval_beta: 1.0
 
 trainer:
   rejection_sample: False # Reject sample prompts that all succeed or all fail (0 signal for GRPO due to normalization).

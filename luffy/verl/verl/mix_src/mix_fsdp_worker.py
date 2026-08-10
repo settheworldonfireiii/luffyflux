@@ -397,7 +397,7 @@ class MIXActorRolloutRefWorker(Worker):
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
             # perform training
             with Timer(name='update_policy', logger=None) as timer:
-                metrics = self.actor.update_policy(data=data)
+                metrics = self.actor.update_policy(data=data, use_reval=data.meta_info.get("use_reval", False),reval_beta=data.meta_info.get("reval_beta", 1.0))
             delta_time = timer.last
             global_num_tokens = data.meta_info['global_token_num']
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
@@ -497,26 +497,28 @@ class MIXActorRolloutRefWorker(Worker):
             )
         torch.cuda.empty_cache()
         return output
-        @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
-        def compute_ref_log_prob(self, data):
-            data = data.to("cuda")
-            data.meta_info.update(
-                micro_batch_size=self.config.ref.log_prob_micro_batch_size,
-                temperature=self.config.rollout.temperature,
-                max_token_len=self.config.ref.log_prob_max_token_len_per_gpu,
-                use_dynamic_bsz=self.config.ref.log_prob_use_dynamic_bsz,
+
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_ref_log_prob(self, data):
+        data = data.to("cuda")
+        data.meta_info.update(
+            micro_batch_size=self.config.ref.log_prob_micro_batch_size,
+            temperature=self.config.rollout.temperature,
+            max_token_len=self.config.ref.log_prob_max_token_len_per_gpu,
+            use_dynamic_bsz=self.config.ref.log_prob_use_dynamic_bsz,
+        )
+
+        with self.ulysses_sharding_manager:
+            data = self.ulysses_sharding_manager.preprocess_data(data)
+            function = (
+                self._compute_reval_ref
+                if data.meta_info.get("ref_mode") == "reval"
+                else self._compute_luffy_ref
             )
+            output = self.ulysses_sharding_manager.postprocess_data(function(data))
 
-            with self.ulysses_sharding_manager:
-                data = self.ulysses_sharding_manager.preprocess_data(data)
-                function = (
-                    self._compute_reval_ref
-                    if data.meta_info.get("ref_mode") == "reval"
-                    else self._compute_luffy_ref
-                )
-                output = self.ulysses_sharding_manager.postprocess_data(function(data))
-
-            return output.to("cpu") 
+        return output.to("cpu") 
         
         """
         @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)

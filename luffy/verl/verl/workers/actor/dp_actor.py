@@ -33,6 +33,9 @@ import verl.utils.torch_functional as verl_F
 
 from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
 
+
+from .mix_core_alg import reval_initial_state_value, reval_trajectory_log_prob
+
 __all__ = ['DataParallelPPOActor']
 
 
@@ -55,7 +58,7 @@ class DataParallelPPOActor(BasePPOActor):
 
         self.compute_entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=True)
 
-    def _forward_micro_batch(self, micro_batch, temperature, compute_entropy = True) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _forward_micro_batch(self, micro_batch, temperature, compute_entropy = True, compute_reval=False) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns: 
             entropy: # (bs, response_len)
@@ -98,6 +101,11 @@ class DataParallelPPOActor(BasePPOActor):
                 logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
 
                 logits_rmpad.div_(temperature)
+                if compute_reval:
+                    values_rmpad = torch.logsumexp(
+                        logits_rmpad.float(),
+                        dim=-1,
+                    )
 
                 # compute entropy
                 entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # ((total_nnz / sp) + pad)
@@ -107,6 +115,13 @@ class DataParallelPPOActor(BasePPOActor):
 
                 # gather log_prob if sp > 1
                 if self.use_ulysses_sp:
+                    if compute_reval:
+                        values_rmpad = gather_outpus_and_unpad(
+                            values_rmpad,
+                            gather_dim=0,
+                            unpad_dim=0,
+                            padding_size=pad_size,
+                        )
                     # gather and unpad for the ulysses sp
                     log_probs = gather_outpus_and_unpad(log_probs, gather_dim=0, unpad_dim=0, padding_size=pad_size)
                     entropy_rmpad = gather_outpus_and_unpad(entropy_rmpad,
@@ -124,6 +139,16 @@ class DataParallelPPOActor(BasePPOActor):
                                            seqlen=seqlen)
 
                 # only return response part:
+                if compute_reval:
+                    full_values = pad_input(
+                        hidden_states=values_rmpad.unsqueeze(-1),
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
+                    initial_value = full_values.squeeze(-1)[
+                        :, -response_length - 1
+                    ]
                 entropy = full_entropy.squeeze(-1)[:, -response_length - 1:-1]  # (bsz, response_length)
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1:-1]  # (bsz, response_length)
 
@@ -134,6 +159,11 @@ class DataParallelPPOActor(BasePPOActor):
                                            use_cache=False)  # prevent model thinks we are generating
                 logits = output.logits
                 logits.div_(temperature)
+                if compute_reval:
+                    initial_value = torch.logsumexp(
+                        logits[:, -response_length - 1, :].float(),
+                        dim=-1,
+                    )
                 logits = logits[:, -response_length - 1:-1]  # (bsz, response_length)
                 log_probs = logprobs_from_logits(logits, micro_batch['responses'])
                 #entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
@@ -142,25 +172,15 @@ class DataParallelPPOActor(BasePPOActor):
                     if compute_entropy
                     else None
                     )
+            if compute_reval:
+                return entropy, log_probs, initial_value
+
             return entropy, log_probs
     
     
-    # Dans DataParallelPPOActor
-    def compute_reval_terms(self, data):
-        values, log_probs = [], []
-        for batch in data.batch.split(data.meta_info["micro_batch_size"]):
-            with torch.no_grad():
-                logits = self.actor_module(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    position_ids=batch["position_ids"],
-                    use_cache=False,
-                ).logits
-            mask = batch["attention_mask"][..., -batch["responses"].size(-1):]
-            values.append(reval_initial_state_value(logits, batch["responses"].size(-1)))
-            log_probs.append(reval_trajectory_log_prob(logits, batch["responses"], mask))
-        return torch.cat(values), torch.cat(log_probs)
-    
+    def compute_reval_terms(self, data, compute_reval=False):
+        return self.compute_log_prob(data, compute_reval=compute_reval)
+
     
     
     def _optimizer_step(self):
@@ -173,7 +193,7 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_optimizer.step()
         return grad_norm
 
-    def compute_log_prob(self, data: DataProto) -> torch.Tensor:
+    def compute_log_prob(self, data: DataProto, compute_reval = False) -> torch.Tensor:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
 
         Args:
@@ -211,16 +231,27 @@ class DataParallelPPOActor(BasePPOActor):
         log_probs_lst = []
         for micro_batch in micro_batches:
             with torch.no_grad():
-                _, log_probs = self._forward_micro_batch(micro_batch, temperature=temperature, compute_entropy=False)
+                if compute_reval:
+                     _, log_probs, value = self._forward_micro_batch(micro_batch,temperature=temperature,compute_entropy=False,compute_reval=True)
+            values_lst.append(value)
+                else:
+                    _, log_probs = self._forward_micro_batch(micro_batch, temperature=temperature, compute_entropy=False)
             log_probs_lst.append(log_probs)
         log_probs = torch.concat(log_probs_lst, dim=0)
+        values = torch.concat(values_lst, dim=0) if compute_reval else None
 
         if use_dynamic_bsz:
             indices = list(itertools.chain.from_iterable(indices))
             assert len(indices) == log_probs.size(0), f"{len(indices)} vs. {log_probs.size()}"
             revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
             log_probs = log_probs[revert_indices]
-
+            if compute_reval:
+                values = values[revert_indices]
+        if compute_reval:
+            responses = batch["responses"]
+            response_mask = batch["attention_mask"][..., -responses.size(-1):]
+            log_pi = (log_probs * response_mask).sum(-1)
+            return values, log_pi
         return log_probs
 
     def update_policy(self, data: DataProto):

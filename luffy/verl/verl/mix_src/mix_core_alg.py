@@ -91,7 +91,7 @@ def compute_reval_loss(v_theta, v_ref, log_pi_theta, log_pi_ref, rewards, beta):
     residual = v_theta - v_ref + log_pi_theta - log_pi_ref - rewards / beta
     return residual.square().mean()
 
-
+"""
 def compute_reval_loss_models_in(model_ref, model_theta, logits_theta, logits_ref, trajectory, attention_mask, rewards, beta):
     with torch.no_grad():
         logits_ref = model_ref(
@@ -115,6 +115,8 @@ def compute_reval_loss_models_in(model_ref, model_theta, logits_theta, logits_re
     rewards = (rewards * response_mask).sum(-1) if rewards.ndim == trajectory.ndim else rewards
     residual = v_theta - v_ref + log_pi_theta - rewards / beta - log_pi_ref
     return residual.square().mean()
+"""
+
 
 def compute_token_on_off_policy_loss(
     old_log_prob, 

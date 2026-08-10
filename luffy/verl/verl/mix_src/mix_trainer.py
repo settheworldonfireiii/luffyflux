@@ -728,7 +728,19 @@ class MIXRayPPOTrainer(RayPPOTrainer):
         self.use_reference_policy = Role.RefPolicy in role_worker_mapping
         self.use_rm = Role.RewardModel in role_worker_mapping
         self.ray_worker_group_cls = ray_worker_group_cls
+        
+        self.use_reval = bool(
+            config.algorithm.get("use_reval", False)
+        )
+        self.reval_beta = float(
+            config.algorithm.get("reval_beta", 1.0)
+        )
 
+        if self.use_reval and self.reval_beta <= 0:
+            raise ValueError("algorithm.reval_beta must be positive")
+
+        if self.use_reval and not self.use_reference_policy:
+            raise ValueError("ReVal requires the reference policy")
         # define KL control
         if self.use_reference_policy:
             if config.algorithm.kl_ctrl.type == 'fixed':
@@ -760,6 +772,8 @@ class MIXRayPPOTrainer(RayPPOTrainer):
             self.resource_pool_to_cls[resource_pool]['actor_rollout'] = actor_rollout_cls
         else:
             raise NotImplementedError
+        if self.use_reval:
+            self.use_critic = False
 
         # create critic
         if self.config.algorithm.adv_estimator == 'gae':
@@ -1361,59 +1375,81 @@ class MIXRayPPOTrainer(RayPPOTrainer):
                         metrics['batch/on_solved'] = (reward_tensor[on_policy_mask].sum(-1) == success_value).sum().item() / (on_policy_mask.sum().item() + 1e-6)
                         metrics['batch/off_solved'] = (reward_tensor[off_policy_mask].sum(-1) == success_value).sum().item() / (off_policy_mask.sum().item() + 1e-6)
                         
+                        batch.meta_info["use_reval"] = self.use_reval
+                        batch.meta_info["reval_beta"] = self.reval_beta
+                        batch.meta_info["temperature"] = (
+                            1.0
+                            if self.use_reval
+                            else self.config.actor_rollout_ref.rollout.temperature
+                        )
+
+
+
+
+
+
+
                         # recompute old_log_probs
-                        with _timer('old_log_prob', timing_raw):
-                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                            batch = batch.union(old_log_prob)
+                        if not use_reval:
+                            with _timer('old_log_prob', timing_raw):
+                                old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                                batch = batch.union(old_log_prob)
 
-                        if self.use_reference_policy:
-                            # compute reference log_prob
-                            with _timer('ref', timing_raw):
-                                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
-                                batch = batch.union(ref_log_prob)
+                            if self.use_reference_policy:
+                                # compute reference log_prob
+                                with _timer('ref', timing_raw):
+                                    ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                                    batch = batch.union(ref_log_prob)
 
-                        # compute rewards with KL penalty if needed
+                            # compute rewards with KL penalty if needed
 
-                        # Note: This kl penalty applied directly over the rewards is disabled for GRPO. The kl penalty is applied at dp_actor.py
-                        # where it is subtracted directly from the policy loss
+                            # Note: This kl penalty applied directly over the rewards is disabled for GRPO. The kl penalty is applied at dp_actor.py
+                            # where it is subtracted directly from the policy loss
 
-                        # compute rewards. apply_kl_penalty if available
-                        if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
-                            batch, kl_metrics = apply_kl_penalty(batch,
-                                                                 kl_ctrl=self.kl_ctrl,
-                                                                 kl_penalty=self.config.algorithm.kl_penalty)
-                            metrics.update(kl_metrics)
-                        else:
-                            batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
+                            # compute rewards. apply_kl_penalty if available
+                            if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
+                                batch, kl_metrics = apply_kl_penalty(batch,
+                                                                     kl_ctrl=self.kl_ctrl,
+                                                                     kl_penalty=self.config.algorithm.kl_penalty)
+                                metrics.update(kl_metrics)
+                            else:
+                                batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
 
-                        # NOTE: the advantages are the same for all tokens in the response
-                        # compute advantages, executed on the driver process
-                        batch = compute_advantage(batch,
-                                                  adv_estimator=self.config.algorithm.adv_estimator,
-                                                  gamma=self.config.algorithm.gamma,
-                                                  lam=self.config.algorithm.lam,
-                                                  grpo_use_std=self.config.algorithm.grpo_use_std)
+                            # NOTE: the advantages are the same for all tokens in the response
+                            # compute advantages, executed on the driver process
+                            batch = compute_advantage(batch,
+                                                      adv_estimator=self.config.algorithm.adv_estimator,
+                                                      gamma=self.config.algorithm.gamma,
+                                                      lam=self.config.algorithm.lam,
+                                                      grpo_use_std=self.config.algorithm.grpo_use_std)
+                                
+                            # compute alpha and beta for prefix reward weighting
+                            prefix_mask = batch.batch['prefix_mask']
+                            advantages = batch.batch['advantages']
+                            assert prefix_mask.shape == advantages.shape
                             
-                        # compute alpha and beta for prefix reward weighting
-                        prefix_mask = batch.batch['prefix_mask']
-                        advantages = batch.batch['advantages']
-                        assert prefix_mask.shape == advantages.shape
-                        
-                        alpha_weight = prefix_mask.float() * self.config.actor_rollout_ref.rollout.prefix_reward_weight_alpha
-                        beta_weight = (~prefix_mask).float() * self.config.actor_rollout_ref.rollout.prefix_reward_weight_beta
-                        prefix_weight = alpha_weight + beta_weight
-                        batch.batch['advantages'] = prefix_weight * advantages
-                        
-                        if self.config.data.get('disable_truncation_advantage', False):
-                            responses = batch.batch['responses']
-                            responses_mask = responses != self.tokenizer.pad_token_id
-                            response_length = responses_mask.sum(-1) # [bsz]
-                            max_len = self.config.data.max_response_length
-                            has_truncated = response_length >= max_len
-                            no_eos = ~((responses == self.tokenizer.eos_token_id).any(-1))
-                            truncated_mask = has_truncated & no_eos
-                            batch.batch['advantages'][truncated_mask] = 0
+                            alpha_weight = prefix_mask.float() * self.config.actor_rollout_ref.rollout.prefix_reward_weight_alpha
+                            beta_weight = (~prefix_mask).float() * self.config.actor_rollout_ref.rollout.prefix_reward_weight_beta
+                            prefix_weight = alpha_weight + beta_weight
+                            batch.batch['advantages'] = prefix_weight * advantages
+                            
+                            if self.config.data.get('disable_truncation_advantage', False):
+                                responses = batch.batch['responses']
+                                responses_mask = responses != self.tokenizer.pad_token_id
+                                response_length = responses_mask.sum(-1) # [bsz]
+                                max_len = self.config.data.max_response_length
+                                has_truncated = response_length >= max_len
+                                no_eos = ~((responses == self.tokenizer.eos_token_id).any(-1))
+                                truncated_mask = has_truncated & no_eos
+                                batch.batch['advantages'][truncated_mask] = 0
+                        else:
+                             with _timer("ref", timing_raw):
+                                ref_terms = self.ref_policy_wg.compute_ref_log_prob(batch)
+                                batch = batch.union(ref_terms)
 
+                            batch.batch["token_level_rewards"] = (
+                                batch.batch["token_level_scores"]
+                            )
                         if self.config.actor_rollout_ref.actor.get('use_sft_prefix_reward', False):
                             assert self.config.actor_rollout_ref.rollout.n_prefix == -1
                             reward_weight = self.config.actor_rollout_ref.actor.get('sft_prefix_reward_weight', 1.0)
@@ -1461,7 +1497,15 @@ class MIXRayPPOTrainer(RayPPOTrainer):
                             self._save_checkpoint()
 
                 # collect metrics
-                metrics.update(compute_data_metrics_ours(batch=batch, use_critic=self.use_critic))
+                if not use_reval:
+                    metrics.update(compute_data_metrics_ours(batch=batch, use_critic=self.use_critic))
+                else:
+                    metrics["reval/reward_mean"] = (
+                    batch.batch["token_level_scores"]
+                    .sum(-1)
+                    .mean()
+                    .item()
+                    )
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
 
                 # TODO: make a canonical logger that supports various backend
