@@ -229,10 +229,11 @@ class DataParallelPPOActor(BasePPOActor):
             micro_batches = batch.split(micro_batch_size)
 
         log_probs_lst = []
+        values_lst = []
         for micro_batch in micro_batches:
             with torch.no_grad():
                 if compute_reval:
-                     _, log_probs, value = self._forward_micro_batch(micro_batch,temperature=temperature,compute_entropy=False,compute_reval=True)
+                    _, log_probs, value = self._forward_micro_batch(micro_batch,temperature=temperature,compute_entropy=False,compute_reval=True)
                     values_lst.append(value)
                 else:
                     _, log_probs = self._forward_micro_batch(micro_batch, temperature=temperature, compute_entropy=False)

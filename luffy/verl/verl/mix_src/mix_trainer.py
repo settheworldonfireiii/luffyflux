@@ -776,7 +776,7 @@ class MIXRayPPOTrainer(RayPPOTrainer):
             self.use_critic = False
 
         # create critic
-        if self.config.algorithm.adv_estimator == 'gae':
+        elif self.config.algorithm.adv_estimator == 'gae':
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
             critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=self.config.critic)
             self.resource_pool_to_cls[resource_pool]['critic'] = critic_cls
@@ -1390,7 +1390,7 @@ class MIXRayPPOTrainer(RayPPOTrainer):
 
 
                         # recompute old_log_probs
-                        if not self.se_reval:
+                        if not self.use_reval:
                             with _timer('old_log_prob', timing_raw):
                                 old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                                 batch = batch.union(old_log_prob)
@@ -1450,7 +1450,7 @@ class MIXRayPPOTrainer(RayPPOTrainer):
                             batch.batch["token_level_rewards"] = (
                                 batch.batch["token_level_scores"]
                             )
-                        if not use_reval and self.config.actor_rollout_ref.actor.get('use_sft_prefix_reward', False):
+                        if not self.use_reval and self.config.actor_rollout_ref.actor.get('use_sft_prefix_reward', False):
                             assert self.config.actor_rollout_ref.rollout.n_prefix == -1
                             reward_weight = self.config.actor_rollout_ref.actor.get('sft_prefix_reward_weight', 1.0)
                             batch.batch['advantages'][prefix_mask] = reward_weight / n_samples

@@ -471,11 +471,12 @@ class MIXActorRolloutRefWorker(Worker):
             )
         
         data = data.to('cuda')
+        use_reval = data.meta_info.get("use_reval", False)
         # we should always recompute old_log_probs when it is HybridEngine
         data.meta_info['micro_batch_size'] = self.config.rollout.log_prob_micro_batch_size
         data.meta_info['max_token_len'] = self.config.rollout.log_prob_max_token_len_per_gpu
         data.meta_info['use_dynamic_bsz'] = self.config.rollout.log_prob_use_dynamic_bsz
-        data.meta_info['temperature'] = self.config.rollout.temperature
+        data.meta_info['temperature'] = (1.0 if use_reval else self.config.rollout.temperature)
         # perform recompute log_prob
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
@@ -502,9 +503,10 @@ class MIXActorRolloutRefWorker(Worker):
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_ref_log_prob(self, data):
         data = data.to("cuda")
+        use_reval = data.meta_info.get("use_reval", False)
         data.meta_info.update(
             micro_batch_size=self.config.ref.log_prob_micro_batch_size,
-            temperature=self.config.rollout.temperature,
+            temperature=(1.0 if use_reval else self.config.rollout.temperature),
             max_token_len=self.config.ref.log_prob_max_token_len_per_gpu,
             use_dynamic_bsz=self.config.ref.log_prob_use_dynamic_bsz,
         )
@@ -546,7 +548,7 @@ class MIXActorRolloutRefWorker(Worker):
 
             torch.cuda.empty_cache()
             return output
-        """
+        
 
         @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
         def compute_log_prob(self, data: DataProto):
@@ -598,7 +600,7 @@ class MIXActorRolloutRefWorker(Worker):
             torch.cuda.empty_cache()
             return output
 
-
+        """
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0):
