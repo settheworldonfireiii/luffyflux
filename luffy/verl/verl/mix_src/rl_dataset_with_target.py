@@ -84,7 +84,7 @@ class RLHFDatasetWithTarget(RLHFDataset):
                  filter_targets=False,
                  sample_target_ratio=1.0,
                  target_list_key='target_lst',
-                 max_num_targets=4,
+                 max_num_targets=3,
                  use_teacher_pool=False,
                  target_probs_key='target_ds_qwen_7b_probs',
         ):

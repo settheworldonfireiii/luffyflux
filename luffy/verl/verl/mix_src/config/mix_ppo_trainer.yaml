@@ -20,7 +20,7 @@ data:
   add_tgt_acc_upper_bound: 0.5
   disable_truncation_advantage: False
   teacher_pool_key: target_lst
-  teacher_pool_size: 4
+  teacher_pool_size: 3
 
 actor_rollout_ref:
   hybrid_engine: True

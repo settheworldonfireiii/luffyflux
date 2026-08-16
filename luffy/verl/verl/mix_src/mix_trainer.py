@@ -58,8 +58,8 @@ from verl.utils.torch_functional import masked_mean, get_eos_mask
 
 def _select_group_members(
     student_scores: torch.Tensor,
-    teacher_count: int = 4,
-    group_n: int = 5,
+    teacher_count: int = 3,
+    group_n: int = 4,
     success_value: float = 1.0,
 ):
     """Select final group members without constructing trajectory tensors.
@@ -101,8 +101,8 @@ def _select_group_members(
 
         if incorrect_indices:
             # Reserve one position for a teacher and one for a wrong student.
-            selected_correct = correct_indices[:group_n - 2]
             selected_wrong = ("student", incorrect_indices[0])
+            selected_correct = correct_indices[:group_n - len(selected_wrong)] 
         else:
             # All current students are correct. Reserve only one teacher slot.
             selected_correct = correct_indices[:group_n - 1]
@@ -111,7 +111,7 @@ def _select_group_members(
         teacher_needed = (
             group_n
             - len(selected_correct)
-            - (1 if selected_wrong is not None else 0)
+            - (1 if ((selected_wrong is not None) and (selected_wrong > 1)) else 0)
         )
 
         if teacher_needed < 1:
@@ -1038,7 +1038,7 @@ class MIXRayPPOTrainer(RayPPOTrainer):
                 #     [B] prompt tensors used by vLLM and teacher materialization
                 #
                 # teacher_pool_batch:
-                #     [B, 4, L] stored teachers; never sent to vLLM
+                #     [B, 3, L] stored teachers; never sent to vLLM
                 #
                 # batch:
                 #     [B] non-tensor metadata, later repeated/reindexed
@@ -1080,7 +1080,7 @@ class MIXRayPPOTrainer(RayPPOTrainer):
                         )
 
                     configured_teacher_count = int(
-                        self.config.data.get("teacher_pool_size", 4)
+                        self.config.data.get("teacher_pool_size", 3)
                     )
                     actual_teacher_count = int(teacher_pool.shape[1])
 
@@ -1521,6 +1521,21 @@ class MIXRayPPOTrainer(RayPPOTrainer):
                         pprint(f'Final validation metrics: {val_metrics}')
                         logger.log(data=val_metrics, step=self.global_steps)
                     return
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     def maybe_save_best_hf(self, val_metrics: dict):
         import json
