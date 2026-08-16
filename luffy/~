@@ -53,7 +53,7 @@ from verl.trainer.ppo.ray_trainer import (
 from verl.utils.torch_functional import masked_mean, get_eos_mask
 
 
-import numpy as np
+
 
 
 def _select_group_members(
@@ -87,8 +87,7 @@ def _select_group_members(
         raise ValueError(f"group_n must be at least 2, got {group_n}")
 
     plans = []
-    teachers_needed = []
-    rng = np.random.default_rng()
+
     for prompt_idx, prompt_scores in enumerate(scores):
         correct_indices = torch.nonzero(
             prompt_scores == success_value,
@@ -122,7 +121,10 @@ def _select_group_members(
                 f"{teacher_needed} teachers, but only {teacher_count} exist"
             )
 
-        plan = rng.choice(teacher_count, size=teacher_needed,replace=False,).tolist()
+        plan = [
+         teacher_idx for teacher_idx in range(teacher_needed)
+        ]
+
         plan.extend( student_idx 
             for student_idx in selected_correct)
 
@@ -136,12 +138,8 @@ def _select_group_members(
             )
 
         plans.append(plan)
-       
-        if teacher_needed != 0:
-            for tn in range(teacher_needed):
-                teachers_needed.append(tn)
 
-    return plans, teachers_needed
+    return plans, teacher_needed
 
 
 def _materialize_teacher_rows(
