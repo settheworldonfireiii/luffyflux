@@ -101,17 +101,17 @@ def _select_group_members(
 
         if incorrect_indices:
             # Reserve one position for a teacher and one for a wrong student.
-            selected_wrong = ("student", incorrect_indices[0])
+            selected_wrong =  incorrect_indices[:]
             selected_correct = correct_indices[:group_n - len(selected_wrong)] 
         else:
             # All current students are correct. Reserve only one teacher slot.
             selected_correct = correct_indices[:group_n - 1]
-            selected_wrong = None
+            selected_wrong = []
 
         teacher_needed = (
             group_n
             - len(selected_correct)
-            - (1 if ((selected_wrong is not None) and (selected_wrong > 1)) else 0)
+            - (1 if len(selected_wrong) > 0) else 0)
         )
 
         if teacher_needed < 1:
@@ -124,14 +124,11 @@ def _select_group_members(
             )
 
         plan = [
-            ("teacher", teacher_idx)
-            for teacher_idx in range(teacher_needed)
+         teacher_idx for teacher_idx in range(teacher_needed)
         ]
 
-        plan.extend(
-            ("student", student_idx)
-            for student_idx in selected_correct
-        )
+        plan.extend( student_idx)
+            for student_idx in selected_correct)
 
         if selected_wrong is not None:
             plan.append(selected_wrong)
@@ -144,7 +141,7 @@ def _select_group_members(
 
         plans.append(plan)
 
-    return plans
+    return plans, teacher_needed
 
 
 def _materialize_teacher_rows(
@@ -1190,7 +1187,7 @@ class MIXRayPPOTrainer(RayPPOTrainer):
                             student_n,
                         )
 
-                        plans = _select_group_members(
+                        plans, n_teach = _select_group_members(
                             student_scores=student_scores,
                             teacher_count=actual_teacher_count,
                             group_n=group_n,
@@ -1201,9 +1198,8 @@ class MIXRayPPOTrainer(RayPPOTrainer):
                         # passed to _assemble_final_groups.
                         teacher_locations = [
                             (prompt_index, member_index)
-                            for prompt_index, plan in enumerate(plans)
+                            for prompt_index, plan in enumerate(plans[:group_n-n_teach])
                             for source, member_index in plan
-                            if source == "teacher"
                         ]
 
                         with _timer(
