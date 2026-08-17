@@ -320,7 +320,6 @@ def _assemble_final_groups(
     teacher_batch: DataProto,
     teacher_rewards: torch.Tensor,
     plans,
-    teacher_locations,
     student_n: int,
     group_n: int,
     n_teach: list[int] | None = None,
