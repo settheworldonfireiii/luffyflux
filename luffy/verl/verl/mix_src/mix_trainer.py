@@ -137,8 +137,7 @@ def _select_group_members(
 
         plans.append(plan)
        
-        if teacher_needed != 0:
-            teachers_needed.append(teacher_needed)
+        teachers_needed.append(teacher_needed)
 
     return plans, teachers_needed
 
@@ -323,6 +322,7 @@ def _assemble_final_groups(
     teacher_locations,
     student_n: int,
     group_n: int,
+    n_teach[Optional]: int,
 ):
     """
     Assemble final contiguous GRPO groups from selected student/teacher rows.
@@ -343,30 +343,31 @@ def _assemble_final_groups(
 
 
     student_tensor_keys = set(student_batch.batch.keys())
-    teacher_tensor_keys = set(teacher_batch.batch.keys())
+    teacher_tensor_keys = ( set(teacher_batch.batch.keys()) if teacher_batch != [] else set())
 
 
     student_non_tensor_keys = set(student_batch.non_tensor_batch.keys())
-    teacher_non_tensor_keys = set(teacher_batch.non_tensor_batch.keys())
+    teacher_non_tensor_keys = ( set(teacher_batch.non_tensor_batch.keys()) if teacher_batch != [] else set())
 
 
 
-    combined_batch = DataProto.concat([
+    combined_batch = (DataProto.concat([
         student_batch,
         teacher_batch,
-    ])
+    ]) if teacher_batch != [] else student_batch)
 
-    combined_rewards = torch.cat(
+    combined_rewards = ( torch.cat(
         (
             student_rewards,
             teacher_rewards.to(student_rewards.device),
         ),
         dim=0,
-    )
+    ) if teacher_batch != [] esle student_rewards)
 
 
     final_indices = []
-
+    
+    teacher_row = expected_student_rows
     for prompt_index, plan in enumerate(plans):
         n = n_teach[prompt_index]
 
@@ -374,7 +375,7 @@ def _assemble_final_groups(
         teacher_row += n
 
 
-        final_indices.extend(prompt_index * student_n + indexfor index in plan[n:])
+        final_indices.extend(prompt_index * student_n + index for index in plan[n:])
 
 
 
@@ -800,23 +801,6 @@ class MIXRayPPOTrainer(RayPPOTrainer):
             )
         )
 
-        if student_n <= 0:
-            raise ValueError(
-                f"rollout.n must be positive, got {student_n}"
-            )
-
-        if group_n <= 0:
-            raise ValueError(
-                f"rollout.group_n must be positive, got {group_n}"
-            )
-
-        if not grade_before_grouping and group_n != student_n:
-            raise ValueError(
-                "Original LUFFY requires rollout.group_n == rollout.n; "
-                f"got group_n={group_n}, n={student_n}"
-            )
-
-        # Retained for the existing optional SFT-prefix code below.
         n_samples = group_n
         if self.config.data.get("add_tgt_with_acc", False):
             n_samples -= 1
@@ -1052,7 +1036,7 @@ class MIXRayPPOTrainer(RayPPOTrainer):
                             "teacher_materialization",
                             timing_raw,
                         ):
-                            teacher_batch = _materialize_teacher_rows(
+                            teacher_batch = (_materialize_teacher_rows(
                                 prompt_batch=prompt_batch,
                                 metadata_batch=batch,
                                 teacher_pool=teacher_pool,
@@ -1063,12 +1047,12 @@ class MIXRayPPOTrainer(RayPPOTrainer):
                                 response_length=student_batch.batch[
                                     "responses"
                                 ].shape[-1],
-                            )
+                            ) if teacher_locations else []
 
                         # Grade selected teachers with the same verifier used for
                         # students. We do not assume teacher reward == 1.
                         with _timer("teacher_reward", timing_raw):
-                            if self.use_rm:
+                            if self.use_rm and teacher_locations:
                                 teacher_rm_scores = (
                                     self.rm_wg.compute_rm_score(
                                         teacher_batch
@@ -1078,9 +1062,9 @@ class MIXRayPPOTrainer(RayPPOTrainer):
                                     teacher_rm_scores
                                 )
 
-                            teacher_rewards = self.reward_fn(
+                            teacher_rewards = ( self.reward_fn(
                                 teacher_batch
-                            )
+                            ) if teacher_locations else [])
 
                         batch, reward_tensor = _assemble_final_groups(
                             student_batch=student_batch,
@@ -1091,6 +1075,7 @@ class MIXRayPPOTrainer(RayPPOTrainer):
                             teacher_locations=teacher_locations,
                             student_n=student_n,
                             group_n=group_n,
+                            n_teach=n_teach,
                         )
 
                         expected_final_rows = (
