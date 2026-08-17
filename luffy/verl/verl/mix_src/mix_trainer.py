@@ -61,6 +61,7 @@ def _select_group_members(
     teacher_count: int = 3,
     group_n: int = 4,
     success_value: float = 1.0,
+    global_step: int =  0
 ):
     """Select final group members without constructing trajectory tensors.
 
@@ -322,7 +323,7 @@ def _assemble_final_groups(
     teacher_locations,
     student_n: int,
     group_n: int,
-    n_teach: Optional[list[int]],
+    n_teach: list[int] | None = None,
 ):
     """
     Assemble final contiguous GRPO groups from selected student/teacher rows.
@@ -1021,7 +1022,7 @@ class MIXRayPPOTrainer(RayPPOTrainer):
                             student_scores=student_scores,
                             teacher_count=actual_teacher_count,
                             group_n=group_n,
-                            global_step = self.global_step,
+                            global_step = self.global_steps,
                         )
 
                         # Materialize only teachers that appear in a final plan.
