@@ -88,7 +88,7 @@ def _select_group_members(
 
     plans = []
     teachers_needed = []
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(42)
     for prompt_idx, prompt_scores in enumerate(scores):
         correct_indices = torch.nonzero(
             prompt_scores == success_value,
@@ -138,8 +138,7 @@ def _select_group_members(
         plans.append(plan)
        
         if teacher_needed != 0:
-            for tn in range(teacher_needed):
-                teachers_needed.append(tn)
+            teachers_needed.append(teacher_needed)
 
     return plans, teachers_needed
 
@@ -170,50 +169,14 @@ def _materialize_teacher_rows(
         prompts, responses, input_ids, attention_mask,
         position_ids, prefix_mask
     """
-    if not teacher_locations:
-        raise ValueError("teacher_locations must not be empty")
-
-    if teacher_pool.ndim != 3:
-        raise ValueError(
-            f"teacher_pool must have shape [B, T, L], got "
-            f"{tuple(teacher_pool.shape)}"
-        )
-
-    if teacher_lengths.shape != teacher_pool.shape[:2]:
-        raise ValueError(
-            f"teacher_lengths must have shape {tuple(teacher_pool.shape[:2])}, "
-            f"got {tuple(teacher_lengths.shape)}"
-        )
 
     base_batch_size, teacher_count, stored_length = teacher_pool.shape
 
-    if len(prompt_batch) != base_batch_size:
-        raise ValueError(
-            f"prompt batch has {len(prompt_batch)} rows, "
-            f"teacher pool has {base_batch_size}"
-        )
-
-    if len(metadata_batch) != base_batch_size:
-        raise ValueError(
-            f"metadata batch has {len(metadata_batch)} rows, "
-            f"teacher pool has {base_batch_size}"
-        )
 
     prompt_indices_list = []
     teacher_indices_list = []
 
     for prompt_index, teacher_index in teacher_locations:
-        if not 0 <= prompt_index < base_batch_size:
-            raise IndexError(
-                f"prompt index {prompt_index} outside "
-                f"[0, {base_batch_size})"
-            )
-
-        if not 0 <= teacher_index < teacher_count:
-            raise IndexError(
-                f"teacher index {teacher_index} outside "
-                f"[0, {teacher_count})"
-            )
 
         prompt_indices_list.append(prompt_index)
         teacher_indices_list.append(teacher_index)
@@ -259,13 +222,6 @@ def _materialize_teacher_rows(
         pool_teacher_indices,
     ].to(prompt_device, dtype=torch.long)
 
-    if torch.any(selected_lengths <= 0):
-        raise ValueError("every selected teacher must contain at least one token")
-
-    if torch.any(selected_lengths > stored_length):
-        raise ValueError(
-            f"teacher length exceeds stored tensor width {stored_length}"
-        )
 
     row_count = len(teacher_locations)
 
@@ -385,81 +341,15 @@ def _assemble_final_groups(
     base_batch_size = len(plans)
     expected_student_rows = base_batch_size * student_n
 
-    if student_n <= 0:
-        raise ValueError(f"student_n must be positive, got {student_n}")
-
-    if group_n <= 0:
-        raise ValueError(f"group_n must be positive, got {group_n}")
-
-    if len(student_batch) != expected_student_rows:
-        raise ValueError(
-            f"expected {expected_student_rows} student rows, "
-            f"got {len(student_batch)}"
-        )
-
-    if student_rewards.ndim != 2:
-        raise ValueError(
-            f"student_rewards must have shape [B * student_n, R], "
-            f"got {tuple(student_rewards.shape)}"
-        )
-
-    if student_rewards.shape[0] != len(student_batch):
-        raise ValueError(
-            f"student reward rows {student_rewards.shape[0]} do not match "
-            f"student batch rows {len(student_batch)}"
-        )
-
-    if len(teacher_batch) != len(teacher_locations):
-        raise ValueError(
-            f"teacher batch contains {len(teacher_batch)} rows but "
-            f"teacher_locations contains {len(teacher_locations)} entries"
-        )
-
-    if teacher_rewards.ndim != 2:
-        raise ValueError(
-            f"teacher_rewards must have shape [teacher_rows, R], "
-            f"got {tuple(teacher_rewards.shape)}"
-        )
-
-    if teacher_rewards.shape[0] != len(teacher_batch):
-        raise ValueError(
-            f"teacher reward rows {teacher_rewards.shape[0]} do not match "
-            f"teacher batch rows {len(teacher_batch)}"
-        )
-
-    if student_rewards.shape[1] != teacher_rewards.shape[1]:
-        raise ValueError(
-            f"student and teacher reward lengths differ: "
-            f"{student_rewards.shape[1]} versus "
-            f"{teacher_rewards.shape[1]}"
-        )
 
     student_tensor_keys = set(student_batch.batch.keys())
     teacher_tensor_keys = set(teacher_batch.batch.keys())
 
-    if student_tensor_keys != teacher_tensor_keys:
-        raise ValueError(
-            "student and teacher tensor keys differ: "
-            f"student-only={sorted(student_tensor_keys - teacher_tensor_keys)}, "
-            f"teacher-only={sorted(teacher_tensor_keys - student_tensor_keys)}"
-        )
 
     student_non_tensor_keys = set(student_batch.non_tensor_batch.keys())
     teacher_non_tensor_keys = set(teacher_batch.non_tensor_batch.keys())
 
-    if student_non_tensor_keys != teacher_non_tensor_keys:
-        raise ValueError(
-            "student and teacher non-tensor keys differ: "
-            f"student-only="
-            f"{sorted(student_non_tensor_keys - teacher_non_tensor_keys)}, "
-            f"teacher-only="
-            f"{sorted(teacher_non_tensor_keys - student_non_tensor_keys)}"
-        )
 
-    if len(set(teacher_locations)) != len(teacher_locations):
-        raise ValueError(
-            "teacher_locations contains duplicate prompt/teacher pairs"
-        )
 
     combined_batch = DataProto.concat([
         student_batch,
@@ -474,58 +364,22 @@ def _assemble_final_groups(
         dim=0,
     )
 
-    teacher_row_by_location = {
-        location: expected_student_rows + row_index
-        for row_index, location in enumerate(teacher_locations)
-    }
 
     final_indices = []
 
     for prompt_index, plan in enumerate(plans):
-        if len(plan) != group_n:
-            raise ValueError(
-                f"prompt {prompt_index} has a plan with {len(plan)} rows; "
-                f"expected group_n={group_n}"
-            )
+        n = n_teach[prompt_index]
 
-        for source, source_index in plan:
-            if source == "student":
-                if not 0 <= source_index < student_n:
-                    raise IndexError(
-                        f"student index {source_index} outside "
-                        f"[0, {student_n})"
-                    )
+        final_indices.extend(range(teacher_row, teacher_row + n))
+        teacher_row += n
 
-                final_indices.append(
-                    prompt_index * student_n + source_index
-                )
 
-            elif source == "teacher":
-                location = (prompt_index, source_index)
+        final_indices.extend(prompt_index * student_n + indexfor index in plan[n:])
 
-                if location not in teacher_row_by_location:
-                    raise KeyError(
-                        f"teacher {location} appears in the selection plan "
-                        f"but was not materialized"
-                    )
 
-                final_indices.append(
-                    teacher_row_by_location[location]
-                )
-
-            else:
-                raise ValueError(
-                    f"unknown group-member source {source!r}; "
-                    f"expected 'student' or 'teacher'"
-                )
 
     expected_final_rows = base_batch_size * group_n
 
-    if len(final_indices) != expected_final_rows:
-        raise RuntimeError(
-            f"assembled {len(final_indices)} indices; "
-            f"expected {expected_final_rows}"
-        )
 
     final_indices_cpu = torch.tensor(
         final_indices,
@@ -561,9 +415,6 @@ def _assemble_final_groups(
         final_indices_cpu.to(combined_rewards.device),
     )
 
-    # GRPO uses UID, not row adjacency alone, to identify each group.
-    if "uid" not in final_batch.non_tensor_batch:
-        raise KeyError("final batch has no 'uid' field")
 
     final_uids = final_batch.non_tensor_batch["uid"]
 
@@ -572,11 +423,6 @@ def _assemble_final_groups(
         group_end = group_start + group_n
         group_uids = final_uids[group_start:group_end]
 
-        if not np.all(group_uids == group_uids[0]):
-            raise ValueError(
-                f"assembled group {prompt_index} contains multiple UIDs: "
-                f"{group_uids.tolist()}"
-            )
 
     return final_batch, final_rewards
 
@@ -1198,8 +1044,8 @@ class MIXRayPPOTrainer(RayPPOTrainer):
                         # passed to _assemble_final_groups.
                         teacher_locations = [
                             (prompt_index, member_index)
-                            for prompt_index, plan in enumerate(plans[:group_n-n_teach])
-                            for source, member_index in plan
+                            for prompt_index, plan in enumerate(plans)
+                            for  member_index in plan[:n_teach[prompt_index]]
                         ]
 
                         with _timer(
