@@ -88,7 +88,7 @@ def _select_group_members(
 
     plans = []
     teachers_needed = []
-    rng = np.random.default_rng(42)
+    rng = np.random.default_rng(42+global_step)
     for prompt_idx, prompt_scores in enumerate(scores):
         correct_indices = torch.nonzero(
             prompt_scores == success_value,
@@ -322,7 +322,7 @@ def _assemble_final_groups(
     teacher_locations,
     student_n: int,
     group_n: int,
-    n_teach[Optional]: int,
+    n_teach: Optional[list[int]],
 ):
     """
     Assemble final contiguous GRPO groups from selected student/teacher rows.
@@ -362,7 +362,7 @@ def _assemble_final_groups(
             teacher_rewards.to(student_rewards.device),
         ),
         dim=0,
-    ) if teacher_batch != [] esle student_rewards)
+    ) if teacher_batch != [] else student_rewards)
 
 
     final_indices = []
@@ -1021,6 +1021,7 @@ class MIXRayPPOTrainer(RayPPOTrainer):
                             student_scores=student_scores,
                             teacher_count=actual_teacher_count,
                             group_n=group_n,
+                            global_step = self.global_step,
                         )
 
                         # Materialize only teachers that appear in a final plan.
@@ -1047,7 +1048,7 @@ class MIXRayPPOTrainer(RayPPOTrainer):
                                 response_length=student_batch.batch[
                                     "responses"
                                 ].shape[-1],
-                            ) if teacher_locations else []
+                            ) if teacher_locations else [])
 
                         # Grade selected teachers with the same verifier used for
                         # students. We do not assume teacher reward == 1.
@@ -1072,7 +1073,6 @@ class MIXRayPPOTrainer(RayPPOTrainer):
                             teacher_batch=teacher_batch,
                             teacher_rewards=teacher_rewards,
                             plans=plans,
-                            teacher_locations=teacher_locations,
                             student_n=student_n,
                             group_n=group_n,
                             n_teach=n_teach,
