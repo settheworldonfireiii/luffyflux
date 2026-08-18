@@ -578,6 +578,8 @@ class MIXRayPPOTrainer(RayPPOTrainer):
         )
         if self.use_reval:
             self.reval_beta = float(config.algorithm.get("reval_beta", 1.0))
+        else:
+            self.reval_beta = 0
 
         # define KL control
         if self.use_reference_policy:
@@ -951,9 +953,9 @@ class MIXRayPPOTrainer(RayPPOTrainer):
                         interleave=True,
                     )
 
-                    student_batch = student_metadata.union(
+                    student_batch = (student_metadata.union(
                         student_output
-                    )
+                    ) if not self.use_reval else _materialize_teacher_rows(prompt_batch,batch,legacy_target_batch.batch["tgt_input_ids"].unsqueeze(1), (legacy_target_batch.batch["tgt_input_ids"] != self.tokenizer.pad_token_id).sum(-1, keepdim=True),[(i, 0) for i in range(base_batch_size)],self.tokenizer.eos_token_id,self.tokenizer.pad_token_id,self.config.actor_rollout_ref.rollout.response_length,).select(batch_keys=["prompts", "responses", "input_ids","attention_mask", "position_ids", "prefix_mask",],non_tensor_batch_keys=[],meta_info_keys=[],))
 
                     if "prefix_ratios" in student_output.meta_info and not self.use_reval:
                         metrics["batch/avg_prefix_ratio"] = float(
@@ -1095,7 +1097,7 @@ class MIXRayPPOTrainer(RayPPOTrainer):
                         # vLLM already returned the complete original LUFFY
                         # group: one T0-prefixed row and n-1 student rows.
                         # Keep its ordering and prefix_mask exactly unchanged.
-                        batch = student_batch
+                        batch =  student_batch  
                         reward_tensor = None
 
                     # In either mode values are computed only on the final
