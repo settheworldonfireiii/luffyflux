@@ -955,9 +955,9 @@ class MIXRayPPOTrainer(RayPPOTrainer):
 
                     student_batch = (student_metadata.union(
                         student_output
-                    ) if not self.use_reval else _materialize_teacher_rows(prompt_batch,batch,legacy_target_batch.batch["tgt_input_ids"].unsqueeze(1), (legacy_target_batch.batch["tgt_input_ids"] != self.tokenizer.pad_token_id).sum(-1, keepdim=True),[(i, 0) for i in range(base_batch_size)],self.tokenizer.eos_token_id,self.tokenizer.pad_token_id,self.config.actor_rollout_ref.rollout.response_length,).select(batch_keys=["prompts", "responses", "input_ids","attention_mask", "position_ids", "prefix_mask",],non_tensor_batch_keys=[],meta_info_keys=[],))
+                    ) if not self.use_reval else _materialize_teacher_rows(prompt_batch,batch,legacy_target_batch.batch["tgt_input_ids"].unsqueeze(1), (legacy_target_batch.batch["tgt_input_ids"] != self.tokenizer.pad_token_id).sum(-1, keepdim=True),[(i, 0) for i in range(base_batch_size)],self.tokenizer.eos_token_id,self.tokenizer.pad_token_id,self.config.actor_rollout_ref.rollout.response_length,))
 
-                    if "prefix_ratios" in student_output.meta_info and not self.use_reval:
+                    if not self.use_reval and  "prefix_ratios" in student_output.meta_info:
                         metrics["batch/avg_prefix_ratio"] = float(
                             np.mean(student_output.meta_info["prefix_ratios"])
                         )
